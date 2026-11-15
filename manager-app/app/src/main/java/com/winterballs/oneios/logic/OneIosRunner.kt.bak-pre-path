@@ -1,0 +1,52 @@
+package com.winterballs.oneios.logic
+
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import java.io.BufferedReader
+
+/**
+ * Обёртка над вызовами oneios_root.sh через su.
+ * Пути и команды повторяют Manager.java (original project).
+ */
+object OneIosRunner {
+
+    const val ROOT_SCRIPT = "/data/local/tmp/oneios/bin/oneios_root.sh"
+    const val STAGE_SCRIPT = "/data/local/tmp/oneios/stage_ios16.sh"
+    const val IMAGE_DIR = "/data/local/tmp/oneios/image"
+
+    data class Result(val ok: Boolean, val output: String)
+
+    /** Выполняет произвольную shell-команду через su. */
+    suspend fun runShell(command: String): Result = withContext(Dispatchers.IO) {
+        try {
+            val process = ProcessBuilder("su", "-c", command)
+                .redirectErrorStream(true)
+                .start()
+            val output = process.inputStream.bufferedReader().use(BufferedReader::readText)
+            val code = process.waitFor()
+            Result(code == 0, output)
+        } catch (e: Exception) {
+            Result(false, "Ошибка выполнения: ${e.message}")
+        }
+    }
+
+    /** Вызывает oneios_root.sh с действием (start / stop / --check). */
+    suspend fun runOneios(action: String): Result {
+        return runShell("$ROOT_SCRIPT $action")
+    }
+
+    /** Проверка готовности системы. */
+    suspend fun checkStatus(): Result {
+        return runOneios("--check")
+    }
+
+    /** Запуск iOS-сессии. */
+    suspend fun startSession(): Result {
+        return runOneios("start")
+    }
+
+    /** Возврат в One UI (safe recovery). */
+    suspend fun stopSession(): Result {
+        return runOneios("stop")
+    }
+}

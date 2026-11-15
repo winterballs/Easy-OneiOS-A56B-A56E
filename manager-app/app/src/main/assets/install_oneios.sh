@@ -27,6 +27,13 @@ if [ ! -f "$IMG_DIR/os.img" ]; then
     tar -xf "$DL_DIR/ios16.5-a56-image.tar.gz" -C "$IMG_DIR"
 fi
 
+# 3.5 Распаковываем data.seed (файловая система для Data-раздела iOS)
+if [ -f "$IMG_DIR/data.seed" ] && [ ! -d "$STAGE/data" ]; then
+    echo "[*] Распаковка data.seed (это займёт время)..."
+    mkdir -p "$STAGE/data"
+    tar -xf "$IMG_DIR/data.seed" -C "$STAGE/data"
+fi
+
 # 4. Скачиваем xnuhost (если нет)
 if [ ! -f "$RT_DIR/xnuhost" ]; then
     echo "[*] Скачивание xnuhost..."

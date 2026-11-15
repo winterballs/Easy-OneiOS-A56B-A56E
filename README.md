@@ -1,3 +1,5 @@
+**Русский** | [English](README_EN.md)
+
 # Easy OneiOS for Samsung Galaxy A56 5G (SM-A566B / SM-A566E / a56x)
 
 [![Device: Galaxy A56 5G](https://img.shields.io/badge/Device-Samsung%20Galaxy%20A56%205G-blue.svg)](https://github.com/winterballs/Easy-OneiOS-A56B-A56E)

@@ -5,7 +5,11 @@
 [![GPU: AMD Xclipse 540](https://img.shields.io/badge/GPU-Samsung%20Xclipse%20540%20(RDNA3)-red.svg)](https://github.com/winterballs/Easy-OneiOS-A56B-A56E)
 [![Knox: 0x0 Safe](https://img.shields.io/badge/Knox-0x0%20Intact-brightgreen.svg)](https://github.com/winterballs/Easy-OneiOS-A56B-A56E)
 
-**Easy OneiOS** is a fork of the OneiOS project that brings an authentic, ultra-optimized iOS userland (Darwin Kernel 22.5.0 / iOS 16.5, XNU, `launchd`, `backboardd`, and `SpringBoard`) to the **Samsung Galaxy A56 5G (`SM-A566B` / `SM-A566E`)**, running alongside Samsung One UI 7.
+**Easy OneiOS** is a fork of the OneiOS project that brings an authentic, ultra-optimized iOS userland (Darwin Kernel 22.5.0 / iOS 16.5, XNU, `launchd`, `backboardd`, and `SpringBoard`) to the **Samsung Galaxy A56 5G (`SM-A566B` / `SM-A566E`)**, running alongside Samsung One UI.
+
+<p align="center">
+  <img src="docs/screenshots/important.jpg" alt="OneiOS Manager" width="320">
+</p>
 
 Unlike traditional ROMs or bare-metal replacements, **Easy OneiOS does not flash partitions or wipe user data**. The iOS userland runs hosted on top of One UI's Linux kernel via a specialized userland XNU host (`xnuhost`), keeping your **Knox warranty bit at 0x0 intact**.
 

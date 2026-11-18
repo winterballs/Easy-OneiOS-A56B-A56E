@@ -29,3 +29,11 @@ build/
 !tools/oneios-tool/tests/kernelgen/golden/build/
 *.bak-*
 *.bak
+
+# бэкапы правок
+*.bak*
+
+# кэш сборки
+.gradle/
+.kotlin/
+*.apk

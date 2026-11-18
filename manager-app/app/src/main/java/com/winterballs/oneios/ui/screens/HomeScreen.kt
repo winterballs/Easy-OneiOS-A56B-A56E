@@ -1,51 +1,115 @@
 package com.winterballs.oneios.ui.screens
 
 import androidx.compose.animation.AnimatedVisibility
-import androidx.compose.foundation.layout.Row
-import androidx.compose.material3.LinearProgressIndicator
-import com.winterballs.oneios.logic.ImageDownloader
-import com.winterballs.oneios.logic.ImageStager
-import kotlinx.coroutines.flow.collectLatest
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.interaction.collectIsPressedAsState
+import androidx.compose.animation.core.animateDpAsState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Download
-import androidx.compose.material.icons.filled.Build
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Restore
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.draw.scale
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import com.winterballs.oneios.logic.OneIosRunner
+import android.app.KeyguardManager
+import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
+import android.os.BatteryManager
+import android.os.Environment
+import android.os.StatFs
+import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.launch
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun HomeScreen(onOpenLogs: () -> Unit) {
+fun HomeScreen(onOpenLogs: () -> Unit, onOpenInstall: () -> Unit, onOpenRun: () -> Unit) {
     val scope = rememberCoroutineScope()
-    val context = LocalContext.current
-    var status by remember { mutableStateOf("ПРОВЕРКА") }
+    var status by rememberSaveable { mutableStateOf("ПРОВЕРКА") }
     var busy by remember { mutableStateOf(false) }
-    var logText by remember { mutableStateOf("") }
-    var downloading by remember { mutableStateOf(false) }
-    var installing by remember { mutableStateOf(false) }
-    var progress by remember { mutableStateOf(0f) }
-
-    // Проверка статуса при старте
+    var logText by rememberSaveable { mutableStateOf("") }
+    
+    val context = LocalContext.current
+    var freeSpaceOk by remember { mutableStateOf(true) }
+    var batteryOk by remember { mutableStateOf(true) }
+    var lockOk by remember { mutableStateOf(true) }
+    var freeSpaceGb by remember { mutableStateOf(0.0) }
+    var batteryPctValue by remember { mutableStateOf(0) }
+    
+    // Функция проверки свободного места (нужно хотя бы 1 ГБ)
+    fun checkFreeSpace(): Boolean {
+        return try {
+            val stat = StatFs("/data/local/tmp/oneios")
+            val freeBytes = stat.availableBytes
+            val requiredBytes = 1024L * 1024L * 1024L // 1 ГБ
+            freeSpaceGb = freeBytes / (1024.0 * 1024.0 * 1024.0)
+            freeBytes >= requiredBytes
+        } catch (e: Exception) {
+            true // Если не можем проверить, не блокируем
+        }
+    }
+    
+    // Функция проверки батареи (должно быть больше 30%)
+    fun checkBattery(): Boolean {
+        return try {
+            val batteryStatus = context.registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+            val level = batteryStatus?.getIntExtra(BatteryManager.EXTRA_LEVEL, -1) ?: -1
+            val scale = batteryStatus?.getIntExtra(BatteryManager.EXTRA_SCALE, -1) ?: -1
+            val batteryPct = if (scale > 0) (level * 100 / scale) else 100
+            batteryPct > 30
+        } catch (e: Exception) {
+            true
+        }
+    }
+    
+    // Функция проверки блокировки экрана (должна быть отключена)
+    fun checkScreenLock(): Boolean {
+        return try {
+            val keyguardManager = context.getSystemService(Context.KEYGUARD_SERVICE) as KeyguardManager
+            val secure = keyguardManager.isDeviceSecure
+            android.util.Log.i("OneiOS", "lockCheck isDeviceSecure=" + secure)
+            secure
+        } catch (e: Exception) {
+            android.util.Log.e("OneiOS", "lockCheck exception", e)
+            true
+        }
+    }
+    
+    // Запускаем проверки при старте
     LaunchedEffect(Unit) {
-        val r = OneIosRunner.checkStatus()
-        status = if (r.ok) "СИСТЕМА ГОТОВА" else "НЕ ГОТОВО"
-        logText = r.output
+        freeSpaceOk = checkFreeSpace()
+        batteryOk = checkBattery()
+        batteryPctValue = (context.registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))?.let { b -> val l = b.getIntExtra(BatteryManager.EXTRA_LEVEL, -1); val sc = b.getIntExtra(BatteryManager.EXTRA_SCALE, -1); if (sc > 0) l * 100 / sc else 0 }) ?: 0
+        lockOk = checkScreenLock()
+    }
+
+    // Проверка статуса при старте (только если лог ещё пустой)
+    LaunchedEffect(Unit) {
+        if (logText.isEmpty()) {
+            val r = OneIosRunner.checkStatus()
+            status = if (r.ok) "СИСТЕМА ГОТОВА" else "НЕ ГОТОВО"
+            logText = r.output
+        }
     }
 
     // Анимация нажатия для главной кнопки
@@ -55,6 +119,30 @@ fun HomeScreen(onOpenLogs: () -> Unit) {
         animationSpec = tween(120),
         label = "buttonScale"
     )
+
+    var showAbout by remember { mutableStateOf(false) }
+    var showRebootConfirm by remember { mutableStateOf(false) }
+    if (showRebootConfirm) AlertDialog(
+        onDismissRequest = { showRebootConfirm = false },
+        title = { Text("Перезагрузить One UI?") },
+        text = { Text("Сессия iOS будет остановлена.") },
+        confirmButton = {
+            TextButton(onClick = {
+                showRebootConfirm = false
+                if (!busy) {
+                    busy = true
+                    scope.launch {
+                        val r = OneIosRunner.stopSession()
+                        logText = r.output
+                        status = "НЕ ГОТОВО"
+                        busy = false
+                    }
+                }
+            }) { Text("Да") }
+        },
+        dismissButton = { TextButton(onClick = { showRebootConfirm = false }) { Text("Отмена") } }
+    )
+    if (showAbout) AboutDialog(onDismiss = { showAbout = false })
 
     Scaffold(
         topBar = {
@@ -83,6 +171,7 @@ fun HomeScreen(onOpenLogs: () -> Unit) {
                 modifier = Modifier.fillMaxWidth()
             ) {
                 Column(Modifier.padding(20.dp)) {
+                    Box(Modifier.fillMaxWidth().height(0.dp)) { Box(Modifier.align(Alignment.TopEnd).offset(y = 24.dp)) { AboutButton(onClick = { showAbout = true }) } }
                     Text(
                         "Samsung Galaxy A56 5G",
                         style = MaterialTheme.typography.titleLarge,
@@ -102,148 +191,112 @@ fun HomeScreen(onOpenLogs: () -> Unit) {
                 }
             }
 
+            // Плитки проверок
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                // Одна карточка: место / батарея / экран
+                Card(
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(16.dp),
+                    colors = CardDefaults.cardColors(
+                        containerColor = MaterialTheme.colorScheme.surfaceVariant
+                    )
+                ) {
+                    Row(Modifier.fillMaxWidth().padding(vertical = 14.dp)) {
+                        Column(Modifier.weight(1f), horizontalAlignment = Alignment.CenterHorizontally) {
+                            Text("Место", style = MaterialTheme.typography.labelMedium)
+                            Text(String.format(java.util.Locale.US, "%.1f ГБ", freeSpaceGb).replace(".", ","), style = MaterialTheme.typography.labelSmall, fontSize = 10.sp)
+                        }
+                        Box(Modifier.width(1.dp).fillMaxHeight().background(MaterialTheme.colorScheme.outlineVariant))
+                        Column(Modifier.weight(1f), horizontalAlignment = Alignment.CenterHorizontally) {
+                            Text("Батарея", style = MaterialTheme.typography.labelMedium)
+                            Text("$batteryPctValue%", style = MaterialTheme.typography.labelSmall, fontSize = 10.sp)
+                        }
+                        Box(Modifier.width(1.dp).fillMaxHeight().background(MaterialTheme.colorScheme.outlineVariant))
+                        Column(Modifier.weight(1f), horizontalAlignment = Alignment.CenterHorizontally) {
+                            Text("Экран", style = MaterialTheme.typography.labelMedium)
+                            Text(if (lockOk) "Пароль есть" else "Без пароля", style = MaterialTheme.typography.labelSmall, fontSize = 10.sp)
+                        }
+                    }
+                }
+
+            }
+
+            val runSrc = remember { MutableInteractionSource() }
+            val runPressed by runSrc.collectIsPressedAsState()
+            val runRadius by animateDpAsState(if (runPressed) 8.dp else 28.dp, label = "runRadius")
+            val installSrc = remember { MutableInteractionSource() }
+            val installPressed by installSrc.collectIsPressedAsState()
+            val installRadius by animateDpAsState(if (installPressed) 8.dp else 24.dp, label = "installRadius")
+            val logsSrc = remember { MutableInteractionSource() }
+            val logsPressed by logsSrc.collectIsPressedAsState()
+            val logsRadius by animateDpAsState(if (logsPressed) 8.dp else 24.dp, label = "logsRadius")
+            val offSrc = remember { MutableInteractionSource() }
+            val offPressed by offSrc.collectIsPressedAsState()
+            val offRadius by animateDpAsState(if (offPressed) 8.dp else 24.dp, label = "offRadius")
+
             // Кнопка запуска iOS (главная, с анимацией)
             Button(
-                onClick = {
-                    if (busy) return@Button
-                    busy = true
-                    scope.launch {
-                        val r = OneIosRunner.startSession()
-                        logText = r.output
-                        status = if (r.ok) "СИСТЕМА ГОТОВА" else "ОШИБКА"
-                        busy = false
-                    }
-                },
+                onClick = { onOpenRun() },
                 modifier = Modifier
                     .fillMaxWidth()
                     .height(56.dp)
                     .scale(scale),
-                shape = RoundedCornerShape(28.dp),
-                enabled = !busy
+                shape = RoundedCornerShape(runRadius),
+                interactionSource = runSrc,
+                enabled = !busy && freeSpaceOk && batteryOk && lockOk
             ) {
                 Icon(Icons.Default.PlayArrow, contentDescription = null)
                 Spacer(Modifier.width(8.dp))
                 Text("Запустить iOS", style = MaterialTheme.typography.titleMedium)
             }
 
-            // Скачать образ
+            // Кнопка установки iOS
             FilledTonalButton(
-                onClick = {
-                    if (downloading) return@FilledTonalButton
-                    downloading = true
-                    progress = 0f
-                    scope.launch {
-                        var total = 0L
-                        var read = 0L
-                        ImageDownloader.downloadAll().collectLatest { p ->
-                            read = p.bytesRead
-                            total = p.totalBytes
-                            progress = if (total > 0) read.toFloat() / total else 0f
-                            logText = "Скачивание части ${p.part}: ${read / 1024 / 1024} MB" +
-                                    (if (total > 0) " / ${total / 1024 / 1024} MB" else "") +
-                                    "\n" + (p.error ?: "")
-                            if (p.done) {
-                                status = "РАСПАКОВКА"
-                                val r = ImageStager.stage()
-                                logText = r.output
-                                status = if (r.ok) "СИСТЕМА ГОТОВА" else "ОШИБКА СТЕЙДЖА"
-                                downloading = false
-                            }
-                            if (p.error != null) {
-                                status = "ОШИБКА СКАЧИВАНИЯ"
-                                downloading = false
-                            }
-                        }
-                    }
-                },
+                onClick = { onOpenInstall() },
                 modifier = Modifier
                     .fillMaxWidth()
                     .height(52.dp),
-                shape = RoundedCornerShape(24.dp),
-                enabled = !downloading && !busy
+                shape = RoundedCornerShape(installRadius),
+                interactionSource = installSrc,
+                colors = ButtonDefaults.filledTonalButtonColors(
+                    containerColor = MaterialTheme.colorScheme.surfaceVariant
+                ),
+                enabled = !busy
             ) {
                 Icon(Icons.Default.Download, contentDescription = null)
                 Spacer(Modifier.width(8.dp))
-                Text(if (downloading) "Скачивание..." else "Скачать образ iOS 16.5")
-            }
-            if (downloading) {
-                LinearProgressIndicator(
-                    progress = { progress },
-                    modifier = Modifier.fillMaxWidth(),
-                )
+                Text("Установить iOS")
             }
 
-            // Кнопка авт��матической установки
-            FilledTonalButton(
-                onClick = {
-                    if (installing) return@FilledTonalButton
-                    installing = true
-                    scope.launch {
-                        val r = OneIosRunner.runInstaller(context)
-                        logText = r.output
-                        status = if (r.ok) "СИСТЕМА ГОТОВА" else "ОШИБКА УСТАНОВКИ"
-                        installing = false
-                        // После установки сразу проверяем статус
-                        val check = OneIosRunner.checkStatus()
-                        if (check.ok) status = "СИСТЕМА ГОТОВА"
-                    }
-                },
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .height(52.dp),
-                shape = RoundedCornerShape(24.dp),
-                enabled = !installing && !busy
-            ) {
-                Icon(Icons.Default.Build, contentDescription = null) // Потребуется импорт Icons.Default.Build
-                Spacer(Modifier.width(8.dp))
-                Text(if (installing) "Установка..." else "Установить iOS (автоматически)")
-            }
-
-            // Вернуться в One UI
-            OutlinedButton(
-                onClick = {
-                    if (busy) return@OutlinedButton
-                    busy = true
-                    scope.launch {
-                        val r = OneIosRunner.stopSession()
-                        logText = r.output
-                        status = "НЕ ГОТОВО"
-                        busy = false
-                    }
-                },
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .height(52.dp),
-                shape = RoundedCornerShape(24.dp),
-                colors = ButtonDefaults.outlinedButtonColors(
-                    contentColor = MaterialTheme.colorScheme.error
-                )
-            ) {
-                Icon(Icons.Default.Restore, contentDescription = null)
-                Spacer(Modifier.width(8.dp))
-                Text("Перезагрузка (One UI)")
-            }
-
-            // Обновить статус + логи
+            // Ряд: Перезагрузка и Логи
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.spacedBy(12.dp)
             ) {
-                TextButton(
-                    onClick = {
-                        scope.launch {
-                            val r = OneIosRunner.checkStatus()
-                            status = if (r.ok) "СИСТЕМА ГОТОВА" else "НЕ ГОТОВО"
-                            logText = r.output
-                        }
-                    },
-                    modifier = Modifier.weight(1f)
+                OutlinedButton(
+                    onClick = { showRebootConfirm = true },
+                    modifier = Modifier
+                        .weight(1f)
+                        .height(52.dp),
+                    shape = RoundedCornerShape(offRadius),
+                    interactionSource = offSrc,
+                    colors = ButtonDefaults.outlinedButtonColors(
+                        contentColor = MaterialTheme.colorScheme.error
+                    )
                 ) {
-                    Icon(Icons.Default.Refresh, contentDescription = null)
-                    Spacer(Modifier.width(6.dp))
-                    Text("Обновить")
+                    Text("Перезагрузка", maxLines = 1, softWrap = false, fontSize = 13.sp)
                 }
-                TextButton(onClick = onOpenLogs, modifier = Modifier.weight(1f)) {
+                OutlinedButton(
+                    onClick = onOpenLogs,
+                    modifier = Modifier
+                        .weight(1f)
+                        .height(52.dp),
+                    shape = RoundedCornerShape(logsRadius),
+                    interactionSource = logsSrc
+                ) {
                     Text("Логи")
                 }
             }
@@ -262,6 +315,7 @@ fun HomeScreen(onOpenLogs: () -> Unit) {
             }
 
             Spacer(Modifier.height(24.dp))
+            Text("designed by winterballs", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.fillMaxWidth(), textAlign = TextAlign.Center)
         }
     }
 }

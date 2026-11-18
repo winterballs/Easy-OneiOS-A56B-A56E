@@ -54,7 +54,7 @@ fun AboutDialog(onDismiss: () -> Unit) {
                 modifier = Modifier.size(72.dp).clip(CircleShape)
             )
         },
-        title = { Text("Easy OneiOS", textAlign = TextAlign.Center, modifier = Modifier.fillMaxWidth()) },
+        title = { Text("EOneiOS", textAlign = TextAlign.Center, modifier = Modifier.fillMaxWidth()) },
         text = {
             Text(
                 "Easy OneiOS — это форк проекта OneiOS, который приносит аутентичный, ультра-оптимизированный iOS userland (Darwin Kernel 22.5.0 / iOS 16.5, XNU, launchd, backboardd и SpringBoard) на Samsung Galaxy A56 5G (SM-A566B / SM-A566E) с возможностью работы параллельно с Samsung One UI."

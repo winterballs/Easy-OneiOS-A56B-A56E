@@ -52,7 +52,6 @@ fun HomeScreen(onOpenLogs: () -> Unit, onOpenInstall: () -> Unit, onOpenRun: () 
     val context = LocalContext.current
     var freeSpaceOk by remember { mutableStateOf(true) }
     var batteryOk by remember { mutableStateOf(true) }
-    var lockOk by remember { mutableStateOf(true) }
     var freeSpaceGb by remember { mutableStateOf(0.0) }
     var batteryPctValue by remember { mutableStateOf(0) }
     
@@ -83,24 +82,12 @@ fun HomeScreen(onOpenLogs: () -> Unit, onOpenInstall: () -> Unit, onOpenRun: () 
     }
     
     // Функция проверки блокировки экрана (должна быть отключена)
-    fun checkScreenLock(): Boolean {
-        return try {
-            val keyguardManager = context.getSystemService(Context.KEYGUARD_SERVICE) as KeyguardManager
-            val secure = keyguardManager.isDeviceSecure
-            android.util.Log.i("OneiOS", "lockCheck isDeviceSecure=" + secure)
-            secure
-        } catch (e: Exception) {
-            android.util.Log.e("OneiOS", "lockCheck exception", e)
-            true
-        }
-    }
     
     // Запускаем проверки при старте
     LaunchedEffect(Unit) {
         freeSpaceOk = checkFreeSpace()
         batteryOk = checkBattery()
         batteryPctValue = (context.registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))?.let { b -> val l = b.getIntExtra(BatteryManager.EXTRA_LEVEL, -1); val sc = b.getIntExtra(BatteryManager.EXTRA_SCALE, -1); if (sc > 0) l * 100 / sc else 0 }) ?: 0
-        lockOk = checkScreenLock()
     }
 
     // Проверка статуса при старте (только если лог ещё пустой)
@@ -148,7 +135,7 @@ fun HomeScreen(onOpenLogs: () -> Unit, onOpenInstall: () -> Unit, onOpenRun: () 
         topBar = {
             TopAppBar(
                 title = {
-                    Text("OneiOS", fontWeight = FontWeight.Bold)
+                    Text("EOneiOS", fontWeight = FontWeight.Bold)
                 },
                 colors = TopAppBarDefaults.topAppBarColors(
                     containerColor = MaterialTheme.colorScheme.surface
@@ -214,11 +201,6 @@ fun HomeScreen(onOpenLogs: () -> Unit, onOpenInstall: () -> Unit, onOpenRun: () 
                             Text("Батарея", style = MaterialTheme.typography.labelMedium)
                             Text("$batteryPctValue%", style = MaterialTheme.typography.labelSmall, fontSize = 10.sp)
                         }
-                        Box(Modifier.width(1.dp).fillMaxHeight().background(MaterialTheme.colorScheme.outlineVariant))
-                        Column(Modifier.weight(1f), horizontalAlignment = Alignment.CenterHorizontally) {
-                            Text("Экран", style = MaterialTheme.typography.labelMedium)
-                            Text(if (lockOk) "Пароль есть" else "Без пароля", style = MaterialTheme.typography.labelSmall, fontSize = 10.sp)
-                        }
                     }
                 }
 
@@ -246,7 +228,7 @@ fun HomeScreen(onOpenLogs: () -> Unit, onOpenInstall: () -> Unit, onOpenRun: () 
                     .scale(scale),
                 shape = RoundedCornerShape(runRadius),
                 interactionSource = runSrc,
-                enabled = !busy && freeSpaceOk && batteryOk && lockOk
+                enabled = !busy && freeSpaceOk && batteryOk
             ) {
                 Icon(Icons.Default.PlayArrow, contentDescription = null)
                 Spacer(Modifier.width(8.dp))

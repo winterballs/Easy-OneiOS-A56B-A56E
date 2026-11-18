@@ -37,3 +37,11 @@ build/
 .gradle/
 .kotlin/
 *.apk
+
+# бэкапы правок
+*.bak*
+
+# кэш сборки
+.gradle/
+.kotlin/
+*.apk

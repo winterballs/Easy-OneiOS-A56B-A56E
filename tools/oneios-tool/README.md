@@ -180,6 +180,14 @@ oneios-tool ioslog save SOURCE NAME.logarchive        # the copy the manual step
 - Copying `data.img` from the phone is `oneios-tool phone pull-data OUT [--ioslog]` ("phone" below). Not there: an
   `Info.plist` in the saved archive (Apple's `log show --archive` wants one; Mandiant's tool does not).
 
+**The times of a hosted iOS 16.5 boot are compressed (A56, 2026-11-19).** In the A56's 20F66 sessions a whole session
+(3 to 8 minutes) shows up as 2 to 6 s of log time right after the boot's first entry, so it looks as if the log stopped
+there. It did not: the entries are all there, in order. Evidence: backboardd's `touchstats ... events starting 34.13 s
+ago` and the next one `13.15 s ago` are 0.34 s apart in log time; lsd's app registration (minutes on the phone) spans
+under 2 s. The factor is about 40, which fits mach ticks at 24 MHz read as nanoseconds (1000/24 = 41.7). Not yet
+known whether the guest reports the wrong timebase to logd or `ioslog` uses the wrong one; `ioslog` does not
+correct it. Read such a boot by order, and multiply log-time offsets from the boot's first entry by about 41.7.
+
 ### The comparison
 
 ```sh

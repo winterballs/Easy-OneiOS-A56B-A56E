@@ -1,0 +1,76 @@
+diff --git a/iokit/Kernel/IODataQueue.cpp b/iokit/Kernel/IODataQueue.cpp
+--- a/iokit/Kernel/IODataQueue.cpp
++++ b/iokit/Kernel/IODataQueue.cpp
+@@ -269,6 +269,50 @@
+ 	msgh->msgh_remote_port = port;
+ }
+ 
++#if XNU_HOSTED
++#include <pexpert/pexpert.h>
++#include <kern/clock.h>
++/*
++ * OneiOS hosted (0075), a debugging aid for the A56 touch lag: how often data queues (IOHIDFamily's event queues to
++ * backboardd among them) tell their reader that data is available, and what the send returned. Boot argument
++ * oneios-dq-notify=1: at most every 2 s, when the counts moved,
++ *   oneios-dq-notify: 812 sends (ok 790, already queued 20, no buffer 0, failed 2), 0 without a port; last 2 s: 64 sends, 60 ok
++ * "already queued" is MACH_SEND_TIMED_OUT: the reader had not taken the previous notification yet. Off without it.
++ */
++static int hosted_dqn_on = -1;
++static uint64_t hosted_dqn_counts[6];   /* sends, ok, timed out, no buffer, failed, no port */
++static uint64_t hosted_dqn_last_sends, hosted_dqn_last_ok, hosted_dqn_last_time;
++static void
++hosted_dqn_note(int what)
++{
++	if (hosted_dqn_on < 0) {
++		int on = 0;
++		hosted_dqn_on = PE_parse_boot_argn("oneios-dq-notify", &on, sizeof(on)) && on;
++	}
++	if (!hosted_dqn_on) {
++		return;
++	}
++	if (what != 5) {
++		__atomic_fetch_add(&hosted_dqn_counts[0], 1, __ATOMIC_RELAXED);
++	}
++	__atomic_fetch_add(&hosted_dqn_counts[what], 1, __ATOMIC_RELAXED);
++	uint64_t now = mach_absolute_time(), ns = 0, last = __atomic_load_n(&hosted_dqn_last_time, __ATOMIC_RELAXED);
++	absolutetime_to_nanoseconds(now - last, &ns);
++	if (last != 0 && ns < 2000000000ULL) {
++		return;
++	}
++	if (!__atomic_compare_exchange_n(&hosted_dqn_last_time, &last, now, false, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {
++		return;
++	}
++	uint64_t s = hosted_dqn_counts[0], ok = hosted_dqn_counts[1];
++	printf("oneios-dq-notify: %llu sends (ok %llu, already queued %llu, no buffer %llu, failed %llu), %llu without a port; "
++	    "last %llu ms: %llu sends, %llu ok\n", s, ok, hosted_dqn_counts[2], hosted_dqn_counts[3], hosted_dqn_counts[4],
++	    hosted_dqn_counts[5], last ? ns / 1000000ULL : 0ULL, s - hosted_dqn_last_sends, ok - hosted_dqn_last_ok);
++	hosted_dqn_last_sends = s;
++	hosted_dqn_last_ok = ok;
++}
++#endif /* XNU_HOSTED */
++
+ void
+ IODataQueue::sendDataAvailableNotification()
+ {
+@@ -279,6 +323,9 @@
+ 	if (msgh->msgh_remote_port) {
+ 		kr = mach_msg_send_from_kernel_with_options(msgh, msgh->msgh_size,
+ 		    MACH64_SEND_TIMEOUT, MACH_MSG_TIMEOUT_NONE);
++#if XNU_HOSTED
++		hosted_dqn_note(kr == MACH_MSG_SUCCESS ? 1 : kr == MACH_SEND_TIMED_OUT ? 2 : kr == MACH_SEND_NO_BUFFER ? 3 : 4);
++#endif
+ 		switch (kr) {
+ 		case MACH_SEND_TIMED_OUT: // Notification already sent
+ 		case MACH_MSG_SUCCESS:
+@@ -289,6 +336,11 @@
+ 			break;
+ 		}
+ 	}
++#if XNU_HOSTED
++	else {
++		hosted_dqn_note(5);
++	}
++#endif
+ }
+ 
+ OSSharedPtr<IOMemoryDescriptor>

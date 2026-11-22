@@ -143,7 +143,7 @@ is gone, writes the hardware's range; the return writes One UI's values back bef
   (or when it would be, while there is no display yet). With the guest's framebuffer driver
   (`kernel/patches/oneios-hosted/display/`) that is `backboardd`'s first frame; the kernel console, which the
   driver also shows, does not count. Until then the switch's dead-man timer runs: no
-  `ready` after `ONEIOS_RETURN_MAX` seconds (600) means an automatic return to One UI.
+  `ready` after `ONEIOS_RETURN_MAX` seconds (1800) means an automatic return to One UI.
 - **Exit means return.** When the xnuhost process ends for any reason, the watcher returns to One UI.
   Exit code 0 = the guest shut down; anything else is logged as a failure.
 - **A guest restart is not an exit.** When the guest restarts itself (iOS's own restart, or the kernel starting the

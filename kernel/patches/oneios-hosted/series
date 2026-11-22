@@ -229,5 +229,47 @@
 0068-hosted-ios16-registered-ports.patch
 0069-hosted-ios16-bootstrap-replies.patch
 
-0070-native-adreno-device-client-open.patch
-0071-native-adreno-virtgpu-device-client.patch
+# iOS 16.5 (20F66) userland on this collection's iOS 27 (24A446) IOMobileGraphicsFamily and IOSurface: the external
+# methods kept their numbers but some structures grew, and the dispatch tables check sizes exactly, so 20F66's
+# calls were refused (0xe00002c2) and the A56's panel stayed black. 0072 rewrites them in is_io_connect_method:
+# IOMobileFramebufferUserClient 5 (the swap record, 0x46c -> 0x6e0) and 74 (1 -> 2 scalars out),
+# IOSurfaceRootUserClient 0/2/4/6/7/34 (the surface info, 24A446's 0xc68 bytes rewritten into 20F66's 0xa68 layout,
+# field by field) and 13 (limits, 0x18 <- 0x28). One line at the first rewrite of each kind: "oneios-iomfb: iOS 16
+# call rewritten for iOS 27: ...". oneios-iomfb-swap16=0: off. Not rewritten (not on the compositor's path):
+# IOSurfaceRootUserClient 27/28 (bulk attachments), 36/38 (accelerator). docs/a56-guide.md has the maps.
+0072-iomfb-ios16-swap-record.patch
+
+# iOS 16.5 (20F66) mediaserverd never ran on the A56: xpcproxy's exec ended with OS_REASON_EXEC 8 (security policy) every
+# 5 s, nothing on the console: a MAC policy refused mac_cred_label_update_execve. 0073 logs which one
+# ("oneios-mac-exec: NAME: policy P refused the credential update (error E)", at most 200 lines) and, with
+# oneios-mac-exec-skip=NAME[,NAME...], ignores a Sandbox refusal for those executables (they run unsandboxed).
+0073-mac-exec-label-report.patch
+
+# A debugging aid for the A56 touch (iOS 16.5 on iOS 27 IOHIDFamily): oneios-dq-dump=N dumps the first N shared data
+# queue entries (IOHIDEvents queued for backboardd) in hex. Off without it.
+0074-shared-queue-dump.patch
+
+# A debugging aid for the A56 touch lag: oneios-dq-notify=1 counts the data queues' "data available" notifications
+# (IOHIDFamily's event queues to backboardd among them) and what each send returned, one line every 2 s. Off without it.
+0075-data-queue-notify-count.patch
+
+# The return's graceful window now flushes iOS's unified log: oneios_power_request() (the bridge's OB_CTL_SHUTDOWN,
+# xnuhost return-graceful-ms) sends logd SIGTERM, so its buffers reach the Data store before the kill. Not a power-off.
+0076-return-logd-flush.patch
+
+# A debugging aid: oneios-log-debug=SUBSYSTEM[,...] writes a Debug logging profile per subsystem into the Data store
+# (/private/var/preferences/Logging/Subsystems) before launchd, so their Info/Debug messages reach the log on disk.
+0077-log-debug-profiles.patch
+
+# A debugging aid for the A56 touch: oneios-dq-head=N dumps, at each "data available" notification, the entry at the
+# queue's head (IOHIDFamily's queues write their events without IOSharedDataQueue::enqueue, which 0074 hooks).
+0078-data-queue-head-dump.patch
+
+# The A56's touch: iOS 27's IOHIDFamily writes digitizer events (0xa0 bytes, x/y/z as doubles, a header before each
+# child) that iOS 16.5's IOKit misreads (0x68 bytes, x/y/z as IOFixed). oneios-hid16=1 rewrites them in place, in
+# 20F66's layout, at each "data available" notification. Off without it.
+0079-hid-digitizer-ios16.patch
+
+# Entitlements an older iOS's binaries lack: oneios-grant=PROC:ENTITLEMENT[,...] answers true for those pairs. The A56's
+# 20F66 configd needs com.apple.networking.ionetworkstack.user-client (iOS 27's IONetworkStack) to name en0.
+0080-entitlement-grant.patch

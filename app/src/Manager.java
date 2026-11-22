@@ -7,6 +7,7 @@ import android.graphics.Color;
 import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
 import android.graphics.drawable.RippleDrawable;
+import android.net.Uri;
 import android.os.Bundle;
 import android.view.Gravity;
 import android.view.View;
@@ -23,12 +24,33 @@ import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.net.HttpURLConnection;
 import java.net.URL;
+import java.security.MessageDigest;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 import java.util.Locale;
+import org.json.JSONArray;
+import org.json.JSONObject;
 
 public final class Manager extends Activity {
-    private static final String PATH = "/data/local/tmp/oneios/bin/oneios_root.sh";
+    private static final String STAGE = "/data/local/tmp/oneios";
+    private static final String PATH = STAGE + "/bin/oneios_root.sh";
+    /** SHA-256 of bin/oneios_root.sh inside assets/bootstrap.tar.gz; build.py refuses an APK where they differ. */
+    private static final String ROOT_SHA = "6c635500bb42807d70b493cbc6a16dc7f56f198f92d2cf6aa43ed94e9b9362db";
+    private static final String BOOTSTRAP_ASSET = "bootstrap.tar.gz";
+    private static final String IMAGE_BASE = "ios16.5-a56-image.tar.gz";
+    // The A56 kernel with kernel patches 0079 (touch in iOS 16.5's event layout) and 0080 (configd's IONetworkStack
+    // entitlement: Wi-Fi's en0). The release image carries an older kernel; this one replaces it in image/ and
+    // stage_ios16.sh records it. Pinned by SHA-256: a download that differs is refused.
+    private static final String KERNEL_ASSET = "a56-kernel.kc";
+    private static final String KERNEL_SHA = "00d8b9cced5e8f02b65e60bd6dc2be676dbc6bf081ec5ee8799b17081a12c6d9";
+    private static final long KERNEL_SIZE = 95731712L;
+    private static final String KERNEL_HASHES_ASSET = "a56-kernel.kc.hashes";
+    private static final String KERNEL_HASHES_SHA = "c081d62eddd4b779a16b55cf400a8ad0a2801363870fb60e0ef5772092c5c485";
+    private static final long KERNEL_HASHES_SIZE = 2976L;
+    private static final String RELEASE_API = "https://api.github.com/repos/Musicalista/OneiOS-A56/releases/tags/v1.0.0";
+    private static final String RELEASE_DL = "https://github.com/Musicalista/OneiOS-A56/releases/download/v1.0.0/";
+    private volatile boolean alive = true;
     private TextView status;
     private TextView badgeText;
     private View badgeDot;
@@ -279,16 +301,90 @@ public final class Manager extends Activity {
 
         root.addView(scroll, new LinearLayout.LayoutParams(-1, 0, 1f));
         setContentView(root);
-
-        run("status");
+        ensureBootstrap();
     }
+
+    @Override
+    protected void onDestroy() {
+        alive = false;
+        super.onDestroy();
+    }
+
+    // --- small helpers -------------------------------------------------------
+
+    /** Runs on the UI thread only while the activity is still alive. */
+    private void ui(Runnable r) {
+        runOnUiThread(() -> {
+            if (alive && !isDestroyed()) r.run();
+        });
+    }
+
+    private void setBadge(String color, String text) {
+        badgeDot.setBackground(makeBox(Color.parseColor(color), 0, 0, 10));
+        badgeText.setText(text);
+        badgeText.setTextColor(Color.parseColor(color.equals("#FFA000") || color.equals("#29B6F6") ? "#E0E0E0" : color));
+    }
+
+    private void say(String line) {
+        status.append(line + "\n");
+        scroll.post(() -> scroll.fullScroll(View.FOCUS_DOWN));
+    }
+
+    private void setStartReady(boolean ready) {
+        start.setEnabled(ready);
+        start.setBackground(makeRipple(Color.parseColor(ready ? "#00C853" : "#262833"), 0x33FFFFFF, 16));
+    }
+
+    /** A single-quoted shell word. */
+    private static String shq(String s) {
+        return "'" + s.replace("'", "'\\''") + "'";
+    }
+
+    private static String sha256(InputStream in) throws Exception {
+        MessageDigest md = MessageDigest.getInstance("SHA-256");
+        byte[] buf = new byte[65536];
+        for (int r; (r = in.read(buf)) != -1;) md.update(buf, 0, r);
+        StringBuilder sb = new StringBuilder();
+        for (byte b : md.digest()) sb.append(String.format(Locale.US, "%02x", b));
+        return sb.toString();
+    }
+
+    /** Runs a command as root; every output line goes to sink (on the worker thread). Returns the exit code. */
+    private static int su(String command, LineSink sink) throws Exception {
+        Process p = new ProcessBuilder("su", "-c", command).redirectErrorStream(true).start();
+        p.getOutputStream().close();
+        try (BufferedReader reader = new BufferedReader(new InputStreamReader(p.getInputStream()))) {
+            for (String line; (line = reader.readLine()) != null;) sink.line(line);
+        }
+        return p.waitFor();
+    }
+
+    private interface LineSink { void line(String l); }
+
+    /** The shell guard used before anything that rewrites the stage: no open session of this boot. */
+    private static final String SESSION_GUARD =
+        "S=" + STAGE + "; "
+        + "if [ \"$(cat $S/control/boot 2>/dev/null)\" = \"$(cat /proc/sys/kernel/random/boot_id)\" ]; then "
+        + "case \"$(cat $S/control/state 2>/dev/null)\" in starting|running|returning) "
+        + "echo '[!] Uma sessão iOS está aberta: volte à One UI antes.'; exit 9 ;; esac; fi; ";
+
+    /** Where this app downloads to: its own external folder (no storage permission needed, survives scoped storage). */
+    private File downloadDir() {
+        File base = getExternalFilesDir(null);
+        File d = new File(base != null ? base : getFilesDir(), "download");
+        if (!d.exists()) d.mkdirs();
+        return d;
+    }
+
+    // --- download / import ---------------------------------------------------
 
     private void showDownloadDialog() {
         if (busy) return;
         final String[] options = {
             "📥   Baixar direto do GitHub Releases (iOS 16.5)",
             "📂   Importar arquivo baixado (/sdcard/Download)",
-            "🔗   Inserir URL personalizada"
+            "🔗   Inserir URL personalizada",
+            "⬆   Atualizar só o kernel (toque + Wi-Fi)"
         };
 
         new AlertDialog.Builder(this)
@@ -298,6 +394,8 @@ public final class Manager extends Activity {
                     startDownloadGithub();
                 } else if (which == 1) {
                     importFromLocal();
+                } else if (which == 3) {
+                    startKernelUpdate();
                 } else {
                     showCustomUrlDialog();
                 }
@@ -306,112 +404,220 @@ public final class Manager extends Activity {
             .show();
     }
 
+    private static final class Part {
+        final String name;
+        final String url;
+        final long size; // -1 = unknown
+        Part(String name, String url, long size) { this.name = name; this.url = url; this.size = size; }
+    }
+
+    /** The image parts of the release, read from the GitHub API; the two known names when the API is unreachable. */
+    private static List<Part> releaseParts() {
+        List<Part> parts = new ArrayList<>();
+        try {
+            HttpURLConnection c = (HttpURLConnection) new URL(RELEASE_API).openConnection();
+            c.setRequestProperty("User-Agent", "OneiOS-Manager/1.1");
+            c.setRequestProperty("Accept", "application/vnd.github+json");
+            c.setConnectTimeout(15000);
+            c.setReadTimeout(20000);
+            if (c.getResponseCode() == HttpURLConnection.HTTP_OK) {
+                StringBuilder sb = new StringBuilder();
+                try (BufferedReader r = new BufferedReader(new InputStreamReader(c.getInputStream(), "UTF-8"))) {
+                    for (String l; (l = r.readLine()) != null;) sb.append(l);
+                }
+                JSONArray assets = new JSONObject(sb.toString()).getJSONArray("assets");
+                for (int i = 0; i < assets.length(); i++) {
+                    JSONObject a = assets.getJSONObject(i);
+                    String n = a.getString("name");
+                    if (n.startsWith(IMAGE_BASE + ".part")) {
+                        parts.add(new Part(n, a.getString("browser_download_url"), a.optLong("size", -1)));
+                    }
+                }
+            }
+            c.disconnect();
+        } catch (Exception ignored) {
+            parts.clear();
+        }
+        if (parts.isEmpty()) {
+            parts.add(new Part(IMAGE_BASE + ".part00", RELEASE_DL + IMAGE_BASE + ".part00", -1));
+            parts.add(new Part(IMAGE_BASE + ".part01", RELEASE_DL + IMAGE_BASE + ".part01", -1));
+        }
+        Collections.sort(parts, (a, b) -> a.name.compareTo(b.name));
+        return parts;
+    }
+
     private void startDownloadGithub() {
         if (busy) return;
         busy = true;
-        start.setEnabled(false);
-        badgeDot.setBackground(makeBox(Color.parseColor("#29B6F6"), 0, 0, 10));
-        badgeText.setText("BAIXANDO");
-        status.setText("[$] Iniciando download do pacote iOS 16.5 direto do GitHub Releases...\n");
+        setStartReady(false);
+        setBadge("#29B6F6", "BAIXANDO");
+        status.setText("[$] Lendo a lista de partes do GitHub Releases...\n");
 
         new Thread(() -> {
-            File downloadDir = new File("/sdcard/Download/OneiOS");
-            if (!downloadDir.exists()) downloadDir.mkdirs();
-
-            String[] partUrls = {
-                "https://github.com/Musicalista/OneiOS-A56/releases/download/v1.0.0/ios16.5-a56-image.tar.gz.part00",
-                "https://github.com/Musicalista/OneiOS-A56/releases/download/v1.0.0/ios16.5-a56-image.tar.gz.part01"
-            };
-
-            File targetMerged = new File(downloadDir, "ios16.5-a56-image.tar.gz");
-
+            File dir = downloadDir();
             try {
-                for (int i = 0; i < partUrls.length; i++) {
-                    final int partIdx = i + 1;
-                    String partUrl = partUrls[i];
-                    File partFile = new File(downloadDir, "ios16.5-a56-image.tar.gz.part0" + i);
-
-                    runOnUiThread(() -> {
-                        status.setText("[$] Conectando ao GitHub Releases (Parte " + partIdx + "/2)...\n");
-                        scroll.post(() -> scroll.fullScroll(View.FOCUS_DOWN));
-                    });
-
-                    URL url = new URL(partUrl);
-                    HttpURLConnection conn = (HttpURLConnection) url.openConnection();
-                    conn.setInstanceFollowRedirects(true);
-                    conn.setRequestProperty("User-Agent", "OneiOS-Manager/1.0");
-                    conn.connect();
-
-                    int code = conn.getResponseCode();
-                    if (code == HttpURLConnection.HTTP_MOVED_PERM || code == HttpURLConnection.HTTP_MOVED_TEMP || code == 307 || code == 308) {
-                        String loc = conn.getHeaderField("Location");
-                        if (loc != null) {
-                            conn.disconnect();
-                            url = new URL(loc);
-                            conn = (HttpURLConnection) url.openConnection();
-                            conn.setRequestProperty("User-Agent", "OneiOS-Manager/1.0");
-                            conn.connect();
-                        }
-                    }
-
-                    code = conn.getResponseCode();
-                    if (code != HttpURLConnection.HTTP_OK) {
-                        conn.disconnect();
-                        throw new java.io.IOException("O servidor respondeu HTTP " + code + " para a parte " + partIdx);
-                    }
-
-                    long totalBytes = conn.getContentLengthLong();
-                    InputStream in = conn.getInputStream();
-                    FileOutputStream out = new FileOutputStream(partFile);
-
-                    byte[] buffer = new byte[65536];
-                    long downloaded = 0;
-                    long lastUpdate = System.currentTimeMillis();
-                    long startTime = lastUpdate;
-                    int read;
-
-                    while ((read = in.read(buffer)) != -1) {
-                        out.write(buffer, 0, read);
-                        downloaded += read;
-                        long now = System.currentTimeMillis();
-                        if (now - lastUpdate > 350) {
-                            lastUpdate = now;
-                            final long d = downloaded;
-                            final long t = totalBytes;
-                            double mbDownloaded = d / (1024.0 * 1024.0);
-                            double mbTotal = t > 0 ? t / (1024.0 * 1024.0) : 0;
-                            double speed = (d / (1024.0 * 1024.0)) / Math.max(0.5, (now - startTime) / 1000.0);
-                            double pct = t > 0 ? (d * 100.0) / t : 0;
-
-                            final String prog = String.format(Locale.US,
-                                "Baixando iOS 16.5 [Parte %d/2]:\n%.1f MB / %.1f MB (%.1f%%) — %.2f MB/s\n",
-                                partIdx, mbDownloaded, mbTotal, pct, speed);
-
-                            runOnUiThread(() -> {
-                                status.setText("[$] Download em andamento...\n" + prog);
-                                scroll.post(() -> scroll.fullScroll(View.FOCUS_DOWN));
-                            });
-                        }
-                    }
-                    out.flush();
-                    out.close();
-                    in.close();
-                    conn.disconnect();
+                List<Part> parts = releaseParts();
+                ui(() -> say("[$] " + parts.size() + " parte(s): destino " + dir.getAbsolutePath()));
+                for (int i = 0; i < parts.size(); i++) {
+                    Part p = parts.get(i);
+                    String label = "Parte " + (i + 1) + "/" + parts.size();
+                    download(p.url, new File(dir, p.name), p.size, label);
                 }
-
-                runOnUiThread(() -> {
-                    status.setText("[$] Download de todas as partes concluído com sucesso!\nIniciando concatenação e extração...\n");
+                downloadKernel(dir);
+                File first = new File(dir, parts.get(0).name);
+                ui(() -> {
+                    say("[$] Download de todas as partes concluído.");
                     busy = false;
-                    extractAndStage(targetMerged.getAbsolutePath());
+                    extractAndStage(first.getAbsolutePath(), true);
                 });
-
             } catch (Exception e) {
-                final String err = e.getMessage();
-                runOnUiThread(() -> {
+                final String err = String.valueOf(e.getMessage());
+                ui(() -> {
                     busy = false;
-                    status.setText("Erro durante o download: " + err + "\n\nVocê também pode baixar os arquivos no computador e importar de /sdcard/Download.");
-                    badgeDot.setBackground(makeBox(Color.parseColor("#FF5252"), 0, 0, 10));
-                    badgeText.setText("ERRO DOWNLOAD");
+                    say("[!] Erro durante o download: " + err);
+                    say("    O que já baixou fica guardado: tocar de novo continua de onde parou.");
+                    setBadge("#FF5252", "ERRO DOWNLOAD");
+                });
+            }
+        }).start();
+    }
+
+    /**
+     * Downloads url to target. Resumes a partial file with a Range request; skips a file already
+     * complete (expected size known). Redirects (GitHub -> its CDN) are followed by HttpURLConnection.
+     */
+    private void download(String fileUrl, File target, long expected, String label) throws Exception {
+        if (expected > 0 && target.length() == expected) {
+            ui(() -> say("[=] " + label + ": " + target.getName() + " já está completo."));
+            return;
+        }
+        long have = target.exists() ? target.length() : 0;
+        if (expected > 0 && have > expected) { target.delete(); have = 0; }
+
+        HttpURLConnection conn = (HttpURLConnection) new URL(fileUrl).openConnection();
+        conn.setInstanceFollowRedirects(true);
+        conn.setRequestProperty("User-Agent", "OneiOS-Manager/1.1");
+        conn.setConnectTimeout(20000);
+        conn.setReadTimeout(60000);
+        if (have > 0) conn.setRequestProperty("Range", "bytes=" + have + "-");
+        int code = conn.getResponseCode();
+        boolean append;
+        if (code == HttpURLConnection.HTTP_PARTIAL && have > 0) {
+            append = true;
+        } else if (code == HttpURLConnection.HTTP_OK) {
+            append = false;
+            have = 0;
+        } else if (code == 416 && have > 0) {
+            // Nothing left to send: the file is already whole.
+            conn.disconnect();
+            return;
+        } else {
+            conn.disconnect();
+            if (code == HttpURLConnection.HTTP_NOT_FOUND) {
+                throw new java.io.IOException("Pacote indisponível neste endereço (HTTP 404): " + target.getName());
+            }
+            throw new java.io.IOException("O servidor respondeu HTTP " + code + " para " + target.getName());
+        }
+        long rest = conn.getContentLengthLong();
+        long total = rest > 0 ? have + rest : expected;
+        final long startAt = have;
+        ui(() -> say("[$] " + label + ": " + target.getName() + (startAt > 0 ? " (continuando de " + (startAt >> 20) + " MB)" : "")));
+
+        try (InputStream in = conn.getInputStream();
+             FileOutputStream out = new FileOutputStream(target, append)) {
+            byte[] buffer = new byte[65536];
+            long done = have;
+            long lastUpdate = System.currentTimeMillis();
+            long startTime = lastUpdate;
+            for (int read; (read = in.read(buffer)) != -1;) {
+                out.write(buffer, 0, read);
+                done += read;
+                long now = System.currentTimeMillis();
+                if (now - lastUpdate > 500) {
+                    lastUpdate = now;
+                    double speed = ((done - startAt) / 1048576.0) / Math.max(0.5, (now - startTime) / 1000.0);
+                    final String prog = total > 0
+                        ? String.format(Locale.US, "%s: %.1f / %.1f MB (%.1f%%) — %.2f MB/s",
+                            label, done / 1048576.0, total / 1048576.0, done * 100.0 / total, speed)
+                        : String.format(Locale.US, "%s: %.1f MB — %.2f MB/s", label, done / 1048576.0, speed);
+                    final String badge = total > 0 ? String.format(Locale.US, "BAIXANDO %d%%", (int) (done * 100 / total)) : "BAIXANDO";
+                    ui(() -> {
+                        badgeText.setText(badge);
+                        progressLine(prog);
+                    });
+                }
+            }
+        } finally {
+            conn.disconnect();
+        }
+        if (expected > 0 && target.length() != expected) {
+            throw new java.io.IOException(target.getName() + " ficou com " + target.length() + " bytes, esperado " + expected);
+        }
+    }
+
+    /** Replaces the last console line when it is a progress line, so progress does not flood the console. */
+    private void progressLine(String text) {
+        CharSequence cur = status.getText();
+        String s = cur.toString();
+        int cut = s.lastIndexOf('\n', s.length() - 2);
+        String last = s.substring(cut + 1);
+        if (last.startsWith("    ↳ ")) status.setText(s.substring(0, cut + 1));
+        say("    ↳ " + text);
+    }
+
+    /** Downloads the pinned kernel pair into dir and checks both hashes. Throws on a mismatch. */
+    private void downloadKernel(File dir) throws Exception {
+        File kc = new File(dir, KERNEL_ASSET), kh = new File(dir, KERNEL_HASHES_ASSET);
+        download(RELEASE_DL + KERNEL_ASSET, kc, KERNEL_SIZE, "Kernel");
+        download(RELEASE_DL + KERNEL_HASHES_ASSET, kh, KERNEL_HASHES_SIZE, "Kernel (hashes)");
+        String[][] want = { { kc.getAbsolutePath(), KERNEL_SHA }, { kh.getAbsolutePath(), KERNEL_HASHES_SHA } };
+        for (String[] w : want) {
+            String got;
+            try (InputStream in = new java.io.FileInputStream(w[0])) { got = sha256(in); }
+            if (!got.equals(w[1])) {
+                new File(w[0]).delete();
+                throw new java.io.IOException(new File(w[0]).getName() + ": SHA-256 " + got.substring(0, 12) + "… não confere com o do app");
+            }
+        }
+        ui(() -> say("[$] Kernel baixado e conferido (SHA-256 " + KERNEL_SHA.substring(0, 12) + "…)."));
+    }
+
+    /** Shell lines that put the downloaded kernel pair (if present in the app's download folder) into $I. */
+    private String kernelInstallShell() {
+        String d = shq(downloadDir().getAbsolutePath());
+        return "KD=" + d + "; if [ -f \"$KD/" + KERNEL_ASSET + "\" ] && [ -f \"$KD/" + KERNEL_HASHES_ASSET + "\" ]; then "
+            + "[ \"$(sha256sum \"$KD/" + KERNEL_ASSET + "\" | cut -d' ' -f1)\" = " + KERNEL_SHA + " ] "
+            + "&& [ \"$(sha256sum \"$KD/" + KERNEL_HASHES_ASSET + "\" | cut -d' ' -f1)\" = " + KERNEL_HASHES_SHA + " ] "
+            + "|| { echo '[!] O kernel baixado não confere com o SHA-256 do app.'; exit 1; }; "
+            + "cat \"$KD/" + KERNEL_ASSET + "\" > \"$I/kernel.kc\" && cat \"$KD/" + KERNEL_HASHES_ASSET + "\" > \"$I/kernel.kc.hashes\" || exit 1; "
+            + "chown 0:0 \"$I/kernel.kc\" \"$I/kernel.kc.hashes\"; chmod 644 \"$I/kernel.kc\" \"$I/kernel.kc.hashes\"; "
+            + "rm -f \"$KD/" + KERNEL_ASSET + "\" \"$KD/" + KERNEL_HASHES_ASSET + "\"; "
+            + "echo '[$] Kernel novo instalado (toque + Wi-Fi).'; fi; ";
+    }
+
+    /** Replaces only the kernel of an image already staged, then records it again (stage_ios16.sh). */
+    private void startKernelUpdate() {
+        if (busy) return;
+        busy = true;
+        setStartReady(false);
+        setBadge("#29B6F6", "BAIXANDO");
+        status.setText("[$] Baixando o kernel novo do GitHub Releases...\n");
+        new Thread(() -> {
+            try {
+                downloadKernel(downloadDir());
+                String sh = SESSION_GUARD
+                    + "I=" + STAGE + "/image; "
+                    + "[ -f \"$I/manifest.json\" ] || { echo '[!] Nenhuma imagem instalada: instale a imagem primeiro.'; exit 1; }; "
+                    + kernelInstallShell()
+                    + "/system/bin/sh $S/stage_ios16.sh > $S/stage_ios16.log 2>&1 || { echo '[!] stage_ios16.sh falhou:'; tail -n 15 $S/stage_ios16.log; exit 1; }; "
+                    + "echo '=== Kernel atualizado ==='";
+                ui(() -> { busy = false; runShell("Atualizar kernel", sh); });
+            } catch (Exception e) {
+                final String err = String.valueOf(e.getMessage());
+                ui(() -> {
+                    busy = false;
+                    say("[!] Erro ao baixar o kernel: " + err);
+                    setBadge("#FF5252", "ERRO DOWNLOAD");
                 });
             }
         }).start();
@@ -434,64 +640,12 @@ public final class Manager extends Activity {
             .setView(container)
             .setPositiveButton("Baixar", (dialog, which) -> {
                 String url = input.getText().toString().trim();
-                if (!url.isEmpty()) {
-                    if (!url.startsWith("https://")) {
-                        status.setText("Informe uma URL HTTPS para o pacote da imagem.");
-                        return;
-                    }
-                    startDownload(url);
+                if (url.isEmpty()) return;
+                if (!url.startsWith("https://")) {
+                    status.setText("Informe uma URL HTTPS para o pacote da imagem.\n");
+                    return;
                 }
-            })
-            .setNegativeButton("Cancelar", null)
-            .show();
-    }
-
-    private void importFromLocal() {
-        File downloadDir = new File("/sdcard/Download");
-        File oneiosDir = new File(downloadDir, "OneiOS");
-        List<File> candidates = new ArrayList<>();
-
-        File[] files = downloadDir.listFiles();
-        if (files != null) {
-            for (File f : files) {
-                String name = f.getName().toLowerCase();
-                if (f.isFile() && (name.contains("ios") || name.contains("oneios") || name.contains("image")) &&
-                    (name.endsWith(".tar") || name.endsWith(".tar.gz") || name.endsWith(".tgz") || name.endsWith(".zip") || name.endsWith(".part00"))) {
-                    candidates.add(f);
-                }
-            }
-        }
-        File[] oneiosFiles = oneiosDir.listFiles();
-        if (oneiosFiles != null) {
-            for (File f : oneiosFiles) {
-                String name = f.getName().toLowerCase();
-                if (f.isFile() && (name.endsWith(".tar") || name.endsWith(".tar.gz") || name.endsWith(".tgz") || name.endsWith(".zip") || name.endsWith(".part00"))) {
-                    if (!candidates.contains(f)) candidates.add(f);
-                }
-            }
-        }
-
-        if (candidates.isEmpty()) {
-            new AlertDialog.Builder(this)
-                .setTitle("Nenhum arquivo encontrado")
-                .setMessage("Nenhum pacote (.tar / .tar.gz) foi encontrado em /sdcard/Download ou /sdcard/Download/OneiOS.\n\nBaixe o arquivo pelo navegador ou copie para o aparelho.")
-                .setPositiveButton("OK", null)
-                .show();
-            return;
-        }
-
-        String[] names = new String[candidates.size()];
-        for (int i = 0; i < candidates.size(); i++) {
-            File c = candidates.get(i);
-            long mb = c.length() / (1024 * 1024);
-            names[i] = c.getName() + " (" + mb + " MB)";
-        }
-
-        new AlertDialog.Builder(this)
-            .setTitle("Selecione o arquivo de imagem")
-            .setItems(names, (dialog, which) -> {
-                File selected = candidates.get(which);
-                extractAndStage(selected.getAbsolutePath());
+                startDownload(url);
             })
             .setNegativeButton("Cancelar", null)
             .show();
@@ -500,200 +654,277 @@ public final class Manager extends Activity {
     private void startDownload(String fileUrl) {
         if (busy) return;
         busy = true;
-        start.setEnabled(false);
-        badgeDot.setBackground(makeBox(Color.parseColor("#29B6F6"), 0, 0, 10));
-        badgeText.setText("BAIXANDO");
+        setStartReady(false);
+        setBadge("#29B6F6", "BAIXANDO");
         status.setText("[$] Conectando ao servidor...\nURL: " + fileUrl + "\n");
 
         new Thread(() -> {
-            File downloadDir = new File("/sdcard/Download/OneiOS");
-            if (!downloadDir.exists()) downloadDir.mkdirs();
-            File targetFile = new File(downloadDir, "ios16.5-a56-image.tar.gz");
-
+            String name = Uri.parse(fileUrl).getLastPathSegment();
+            if (name == null || !name.matches("[A-Za-z0-9._+-]+")
+                || !(name.endsWith(".tar") || name.endsWith(".tar.gz") || name.endsWith(".tgz") || name.endsWith(".zip"))) {
+                name = "custom-image.tar.gz";
+            }
+            File target = new File(downloadDir(), name);
             try {
-                URL url = new URL(fileUrl);
-                HttpURLConnection conn = (HttpURLConnection) url.openConnection();
-                conn.setInstanceFollowRedirects(true);
-                conn.setRequestProperty("User-Agent", "OneiOS-Manager/1.0");
-                conn.connect();
-
-                int code = conn.getResponseCode();
-                if (code == HttpURLConnection.HTTP_MOVED_PERM || code == HttpURLConnection.HTTP_MOVED_TEMP || code == 307 || code == 308) {
-                    String loc = conn.getHeaderField("Location");
-                    if (loc != null) {
-                        conn.disconnect();
-                        url = new URL(loc);
-                        conn = (HttpURLConnection) url.openConnection();
-                        conn.setRequestProperty("User-Agent", "OneiOS-Manager/1.0");
-                        conn.connect();
-                    }
-                }
-
-                code = conn.getResponseCode();
-                if (code != HttpURLConnection.HTTP_OK) {
-                    conn.disconnect();
-                    if (code == HttpURLConnection.HTTP_NOT_FOUND) {
-                        throw new java.io.IOException("Pacote indisponível neste endereço (HTTP 404). Importe um pacote local ou informe outra URL.");
-                    }
-                    throw new java.io.IOException("O servidor respondeu HTTP " + code + ".");
-                }
-                long totalBytes = conn.getContentLengthLong();
-                InputStream in = conn.getInputStream();
-                FileOutputStream out = new FileOutputStream(targetFile);
-
-                byte[] buffer = new byte[65536];
-                long downloaded = 0;
-                long lastUpdate = System.currentTimeMillis();
-                long startTime = lastUpdate;
-                int read;
-
-                while ((read = in.read(buffer)) != -1) {
-                    out.write(buffer, 0, read);
-                    downloaded += read;
-                    long now = System.currentTimeMillis();
-                    if (now - lastUpdate > 350) {
-                        lastUpdate = now;
-                        final long d = downloaded;
-                        final long t = totalBytes;
-                        double mbDownloaded = d / (1024.0 * 1024.0);
-                        double mbTotal = t > 0 ? t / (1024.0 * 1024.0) : 0;
-                        double speed = (d / (1024.0 * 1024.0)) / Math.max(0.5, (now - startTime) / 1000.0);
-                        double pct = t > 0 ? (d * 100.0) / t : 0;
-
-                        final String prog = String.format(Locale.US,
-                            "Baixando imagem iOS 16.5:\n%.1f MB / %.1f MB (%.1f%%) — %.2f MB/s\n",
-                            mbDownloaded, mbTotal, pct, speed);
-
-                        runOnUiThread(() -> {
-                            status.setText("[$] Download em andamento...\n" + prog);
-                            scroll.post(() -> scroll.fullScroll(View.FOCUS_DOWN));
-                        });
-                    }
-                }
-                out.flush();
-                out.close();
-                in.close();
-                conn.disconnect();
-
-                runOnUiThread(() -> {
-                    status.setText("[$] Download concluído com sucesso (" + (targetFile.length() / (1024 * 1024)) + " MB)!\nIniciando extração...\n");
+                download(fileUrl, target, -1, "Imagem");
+                ui(() -> {
+                    say("[$] Download concluído (" + (target.length() >> 20) + " MB).");
                     busy = false;
-                    extractAndStage(targetFile.getAbsolutePath());
+                    extractAndStage(target.getAbsolutePath(), true);
                 });
-
             } catch (Exception e) {
-                final String err = e.getMessage();
-                runOnUiThread(() -> {
+                final String err = String.valueOf(e.getMessage());
+                ui(() -> {
                     busy = false;
-                    status.setText("Erro durante o download: " + err + "\n\nVocê também pode baixar o arquivo no computador ou navegador e importar de /sdcard/Download.");
-                    badgeDot.setBackground(makeBox(Color.parseColor("#FF5252"), 0, 0, 10));
-                    badgeText.setText("ERRO DOWNLOAD");
+                    say("[!] Erro durante o download: " + err);
+                    say("    Você também pode baixar o arquivo no navegador e importar de /sdcard/Download.");
+                    setBadge("#FF5252", "ERRO DOWNLOAD");
                 });
             }
         }).start();
     }
 
-    private void extractAndStage(String archivePath) {
-        String shellCmd = "echo '=== Preparando Imagem iOS 16.5 ===' && "
-            + "mkdir -p /data/local/tmp/oneios/image && "
-            + "DIR=$(dirname '" + archivePath + "') && "
-            + "ARCH='" + archivePath + "' && "
-            + "if [ -f \"$DIR/ios16.5-a56-image.tar.gz.part00\" ] && [ ! -s \"$DIR/ios16.5-a56-image.tar.gz\" ]; then "
-            + "  echo '[$] Concatenando partes baixadas (part00 + part01)...' && "
-            + "  cat \"$DIR/ios16.5-a56-image.tar.gz.part\"* > \"$DIR/ios16.5-a56-image.tar.gz\" && "
-            + "  ARCH=\"$DIR/ios16.5-a56-image.tar.gz\"; "
-            + "fi && "
-            + "echo '[$] Descompactando arquivos no runtime...' && "
-            + "tar -xf \"$ARCH\" -C /data/local/tmp/oneios/image/ && "
-            + "chown -R 0:0 /data/local/tmp/oneios/image && "
-            + "chmod 644 /data/local/tmp/oneios/image/* && "
-            + "if [ -f /data/local/tmp/oneios/stage_ios16.sh ]; then /data/local/tmp/oneios/stage_ios16.sh; "
-            + "elif [ -f /data/local/tmp/oneios/tools/stage_ios16.sh ]; then /data/local/tmp/oneios/tools/stage_ios16.sh; fi";
-        runShell("Extrair e Configurar Imagem iOS 16.5", shellCmd);
+    /**
+     * Lists the packages in /sdcard/Download (two levels) and in this app's download folder. Read as root:
+     * with scoped storage the app itself cannot see files that the browser or a PC put in Download.
+     */
+    private void importFromLocal() {
+        if (busy) return;
+        busy = true;
+        status.setText("[$] Procurando pacotes em /sdcard/Download...\n");
+        new Thread(() -> {
+            List<String> paths = new ArrayList<>();
+            List<String> labels = new ArrayList<>();
+            String cmd = "for d in /sdcard/Download " + shq(downloadDir().getAbsolutePath()) + "; do "
+                + "[ -d \"$d\" ] && find \"$d\" -maxdepth 2 -type f \\( -iname '*.tar' -o -iname '*.tar.gz' -o -iname '*.tgz' "
+                + "-o -iname '*.zip' -o -iname '*.part00' \\) 2>/dev/null; done | sort -u | while read -r f; do "
+                + "echo \"@@F $(stat -c %s \"$f\") $f\"; done";
+            try {
+                su(cmd, l -> {
+                    if (!l.startsWith("@@F ")) return;
+                    int sp = l.indexOf(' ', 4);
+                    if (sp < 0) return;
+                    String path = l.substring(sp + 1);
+                    String lower = path.toLowerCase(Locale.US);
+                    long mb = 0;
+                    try { mb = Long.parseLong(l.substring(4, sp)) >> 20; } catch (NumberFormatException ignored) {}
+                    paths.add(path);
+                    String shown = path.startsWith(downloadDir().getAbsolutePath()) ? "[app] " + new File(path).getName() : path.replace("/sdcard/Download/", "");
+                    labels.add(shown + (lower.endsWith(".part00") ? "  (+ partes seguintes)" : "") + "  — " + mb + " MB");
+                });
+            } catch (Exception e) {
+                final String err = String.valueOf(e.getMessage());
+                ui(() -> { busy = false; say("[!] Não foi possível listar como root: " + err); });
+                return;
+            }
+            // A merged leftover (old app versions joined the parts on disk) beside its parts: offer the parts only.
+            for (int i = paths.size() - 1; i >= 0; i--) {
+                if (paths.contains(paths.get(i) + ".part00")) { paths.remove(i); labels.remove(i); }
+            }
+            ui(() -> {
+                busy = false;
+                if (paths.isEmpty()) {
+                    say("Nenhum pacote encontrado.");
+                    new AlertDialog.Builder(this)
+                        .setTitle("Nenhum arquivo encontrado")
+                        .setMessage("Nenhum pacote (.tar, .tar.gz, .zip ou .part00) foi encontrado em /sdcard/Download (nem uma pasta abaixo dela).\n\nBaixe o arquivo pelo navegador ou copie para o aparelho.")
+                        .setPositiveButton("OK", null)
+                        .show();
+                    return;
+                }
+                say(paths.size() + " pacote(s) encontrado(s).");
+                new AlertDialog.Builder(this)
+                    .setTitle("Selecione o arquivo de imagem")
+                    .setItems(labels.toArray(new String[0]), (dialog, which) -> extractAndStage(paths.get(which), false))
+                    .setNegativeButton("Cancelar", null)
+                    .show();
+            });
+        }).start();
+    }
+
+    // --- staging -------------------------------------------------------------
+
+    /**
+     * Unpacks a package into a fresh image/ and stages it (stage_ios16.sh: image.conf, image.sha256, image.ids).
+     * Parts (NAME.part00, .part01, ...) are streamed straight into tar, so no merged copy takes the space twice.
+     * fromApp: the archive is this app's own download, deleted once the image is staged.
+     */
+    private void extractAndStage(String archivePath, boolean fromApp) {
+        String img = STAGE + "/image";
+        String sh = SESSION_GUARD
+            + "A=" + shq(archivePath) + "; I=" + img + "; N=" + img + ".new; "
+            + "[ -f $S/stage_ios16.sh ] || { echo '[!] stage_ios16.sh ausente: reabra o app para reinstalar o ambiente.'; exit 1; }; "
+            + "[ -f \"$A\" ] || { echo \"[!] Arquivo não encontrado: $A\"; exit 1; }; "
+            + "echo '=== Preparando imagem iOS 16.5 ==='; "
+            + "echo \"[$] Livre em /data: $(df -h /data | tail -n 1 | awk '{print $4}')\"; "
+            + "rm -rf \"$N\" && mkdir -p \"$N\" || exit 1; "
+            + "case \"$A\" in "
+            + "*.part00) B=${A%.part00}; echo '[$] Partes:'; ls -l \"$B\".part* | awk '{print \"    \" $5 \"  \" $NF}'; "
+            + "  echo '[$] Descompactando as partes em sequência (sem juntar em disco)...'; "
+            + "  cat \"$B\".part* | tar -xzf - -C \"$N\" ;; "
+            + "*.zip|*.ZIP) echo '[$] Descompactando zip...'; unzip -q -o \"$A\" -d \"$N\" ;; "
+            + "*) if [ \"$(head -c 2 \"$A\" | od -An -tx1 | tr -d ' \\n')\" = 1f8b ]; then Z=z; else Z=; fi; "
+            + "  echo '[$] Descompactando...'; tar -x${Z}f \"$A\" -C \"$N\" ;; "
+            + "esac || { echo '[!] A extração falhou (arquivo incompleto ou corrompido?). A imagem anterior foi mantida.'; rm -rf \"$N\"; exit 1; }; "
+            // A package with everything inside one folder: take that folder's contents.
+            + "if [ ! -e \"$N/manifest.json\" ]; then set -- \"$N\"/*; "
+            + "  if [ $# -eq 1 ] && [ -d \"$1\" ]; then echo \"[$] Conteúdo dentro de $(basename \"$1\")/: subindo um nível\"; "
+            + "    D=\"$1\"; mv \"$D\" \"$N.d\" && rmdir \"$N\" && mv \"$N.d\" \"$N\" || exit 1; fi; fi; "
+            + "[ -e \"$N/manifest.json\" ] || echo '[!] Aviso: manifest.json não está na raiz do pacote.'; "
+            + "[ -n \"$(ls -A \"$N\")\" ] || { echo '[!] O pacote está vazio.'; rm -rf \"$N\"; exit 1; }; "
+            + "rm -rf \"$I\" && mv \"$N\" \"$I\" || exit 1; "
+            + "chown -R 0:0 \"$I\"; find \"$I\" -type d -exec chmod 755 {} +; find \"$I\" -type f -exec chmod 644 {} +; "
+            + kernelInstallShell()
+            + "echo '[$] Calculando checksums (stage_ios16.sh)...'; "
+            + "/system/bin/sh $S/stage_ios16.sh > $S/stage_ios16.log 2>&1 || { echo '[!] stage_ios16.sh falhou:'; tail -n 15 $S/stage_ios16.log; exit 1; }; "
+            + "echo \"[$] $(wc -l < $S/image.sha256) arquivo(s) registrados; log completo em $S/stage_ios16.log\"; "
+            + (fromApp
+                ? "case \"$A\" in *.part00) rm -f \"${A%.part00}\".part* ;; *) rm -f \"$A\" ;; esac; echo '[$] Download apagado para liberar espaço.'; "
+                : "")
+            + "echo '=== Imagem pronta ==='";
+        runShell("Extrair e configurar imagem iOS 16.5", sh);
     }
 
     private void runShell(String actionLabel, String command) {
         if (busy) return;
         busy = true;
-        start.setEnabled(false);
-        start.setBackground(makeRipple(Color.parseColor("#262833"), 0x33FFFFFF, 16));
-        badgeDot.setBackground(makeBox(Color.parseColor("#FFA000"), 0, 0, 10));
-        badgeText.setText("EXECUTANDO");
+        setStartReady(false);
+        setBadge("#FFA000", "EXECUTANDO");
         status.setText("[$] " + actionLabel + "\n");
 
         new Thread(() -> {
+            int exit;
             try {
-                Process process = new ProcessBuilder("su", "-c", command).redirectErrorStream(true).start();
-                try (BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()))) {
-                    for (String line; (line = reader.readLine()) != null;) {
-                        final String l = line;
-                        runOnUiThread(() -> {
-                            status.append(l + "\n");
-                            scroll.post(() -> scroll.fullScroll(View.FOCUS_DOWN));
-                        });
-                    }
-                }
-                process.waitFor();
+                exit = su(command, l -> ui(() -> say(l)));
             } catch (Exception e) {
-                final String err = e.getMessage();
-                runOnUiThread(() -> {
-                    status.append("Erro: " + err + "\n");
-                    scroll.post(() -> scroll.fullScroll(View.FOCUS_DOWN));
-                });
+                final String err = String.valueOf(e.getMessage());
+                ui(() -> say("Erro: " + err));
+                exit = -1;
             }
-            runOnUiThread(() -> {
+            final int code = exit;
+            ui(() -> {
                 busy = false;
-                run("status");
+                if (code != 0) {
+                    say("[!] Terminou com erro (código " + code + ").");
+                    setBadge("#FF5252", "ERRO");
+                    return;
+                }
+                run("status", true);
             });
         }).start();
     }
 
+    // --- bootstrap -----------------------------------------------------------
+
+    /**
+     * Installs (or updates) the root scripts and the runtime from assets/bootstrap.tar.gz into the stage.
+     * The check runs as root: the app cannot see inside /data/local/tmp. The installed bootstrap's SHA-256 is
+     * kept in $STAGE/.bootstrap, so a new APK replaces an old bootstrap, and nothing is rewritten otherwise.
+     * The image set and the session data are never touched.
+     */
+    private void ensureBootstrap() {
+        busy = true;
+        setBadge("#FFA000", "VERIFICANDO");
+        new Thread(() -> {
+            try {
+                String want;
+                try (InputStream in = getAssets().open(BOOTSTRAP_ASSET)) {
+                    want = sha256(in);
+                }
+                StringBuilder probe = new StringBuilder();
+                su("S=" + STAGE + "; [ \"$(cat $S/.bootstrap 2>/dev/null)\" = " + want + " ] && [ -f $S/bin/oneios_root.sh ] && echo @@CURRENT",
+                    l -> probe.append(l).append('\n'));
+                if (probe.indexOf("@@CURRENT") < 0) {
+                    ui(() -> {
+                        setBadge("#FFA000", "INSTALANDO");
+                        status.setText("[$] Instalando o ambiente do OneiOS em " + STAGE + "...\n");
+                    });
+                    File tarFile = new File(getCacheDir(), BOOTSTRAP_ASSET);
+                    try (InputStream in = getAssets().open(BOOTSTRAP_ASSET);
+                         FileOutputStream fos = new FileOutputStream(tarFile)) {
+                        byte[] buf = new byte[65536];
+                        for (int r; (r = in.read(buf)) != -1;) fos.write(buf, 0, r);
+                    }
+                    String t = shq(tarFile.getAbsolutePath());
+                    String cmd = SESSION_GUARD
+                        + "mkdir -p $S && chown 0:0 $S && chmod 0700 $S || exit 1; "
+                        + "rm -rf $S/bin $S/runtime $S/runtime.sha256 $S/runtime.conf $S/.bootstrap; "
+                        + "tar -xzf " + t + " -C $S || { echo '[!] tar falhou'; rm -f " + t + "; exit 1; }; "
+                        + "rm -f " + t + "; "
+                        + "chown -R 0:0 $S/bin $S/runtime $S/runtime.sha256 $S/runtime.conf $S/*.sh; "
+                        + "find $S/bin $S/runtime -type d -exec chmod 755 {} +; "
+                        + "find $S/bin $S/runtime -type f -exec chmod 644 {} +; "
+                        + "chmod 755 $S/bin/*.sh $S/runtime/bin/*; chmod 700 $S/oneios_switch.sh; chmod 755 $S/oneios_return.sh $S/stage_ios16.sh; "
+                        + "chmod 644 $S/runtime.sha256 $S/runtime.conf; "
+                        // The A56's USB gadget drops adb during a session: the switch's USB watcher and the return
+                        // repair it only with this flag (oneios_switch.sh usb_save, "repair=").
+                        + "touch $S/usb-repair && chmod 644 $S/usb-repair; "
+                        + "[ \"$(sha256sum $S/bin/oneios_root.sh | cut -d' ' -f1)\" = " + ROOT_SHA + " ] || { echo '[!] oneios_root.sh do pacote não confere com o pin do app'; exit 1; }; "
+                        + "echo " + want + " > $S/.bootstrap; "
+                        + "echo '[$] Ambiente instalado.'";
+                    int code = su(cmd, l -> ui(() -> say(l)));
+                    if (code != 0) {
+                        final int c = code;
+                        ui(() -> say("[!] A instalação automática falhou (código " + c + ")."));
+                    }
+                }
+            } catch (Exception e) {
+                final String err = String.valueOf(e.getMessage());
+                ui(() -> say("[!] Erro na instalação automática: " + err));
+            }
+            ui(() -> {
+                busy = false;
+                run("status", true);
+            });
+        }).start();
+    }
+
+    // --- oneios_root.sh ------------------------------------------------------
+
     private void run(String action) {
+        run(action, false);
+    }
+
+    /** Runs one verb of the pinned root script. append: keep what the console already shows. */
+    private void run(String action, boolean append) {
         if (busy) return;
         busy = true;
-        start.setEnabled(false);
-        start.setBackground(makeRipple(Color.parseColor("#262833"), 0x33FFFFFF, 16));
-        badgeDot.setBackground(makeBox(Color.parseColor("#FFA000"), 0, 0, 10));
-        badgeText.setText("EXECUTANDO");
-        status.setText("[$] oneios_root.sh " + action + "\n");
+        setStartReady(false);
+        setBadge("#FFA000", "EXECUTANDO");
+        if (append) say("\n[$] oneios_root.sh " + action);
+        else status.setText("[$] oneios_root.sh " + action + "\n");
 
         new Thread(() -> {
             String result;
+            int exit = -1;
             try {
-                String command = "test \"$(sha256sum " + PATH + " | cut -d' ' -f1)\" = 6c635500bb42807d70b493cbc6a16dc7f56f198f92d2cf6aa43ed94e9b9362db"
-                    + " || { echo 'O script do OneiOS está ausente ou mudou.'; exit 1; }; "
+                String command = "test \"$(sha256sum " + PATH + " 2>/dev/null | cut -d' ' -f1)\" = " + ROOT_SHA
+                    + " || { echo 'O script do OneiOS está ausente ou mudou (reabra o app para reinstalar).'; exit 1; }; "
                     + "/system/bin/sh " + PATH + " " + action;
-                Process process = new ProcessBuilder("su", "-c", command).redirectErrorStream(true).start();
                 StringBuilder output = new StringBuilder();
-                try (BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()))) {
-                    for (String line; (line = reader.readLine()) != null;) {
-                        output.append(line).append('\n');
-                    }
-                }
-                int exit = process.waitFor();
+                exit = su(command, l -> output.append(l).append('\n'));
                 result = output.length() == 0
-                    ? (exit == 0 ? "Comando concluído com sucesso." : "Erro: Verifique a concessão de root no KernelSU.")
+                    ? (exit == 0 ? "Comando concluído com sucesso." : "Erro: verifique a concessão de root no KernelSU.")
                     : output.toString();
             } catch (Exception error) {
                 result = "Erro ao executar via root: " + error.getMessage();
             }
             final String message = result;
-            runOnUiThread(() -> {
+            ui(() -> {
                 busy = false;
-                status.setText(message);
-                scroll.post(() -> scroll.fullScroll(View.FOCUS_DOWN));
+                if (append) say(message.trim());
+                else {
+                    status.setText(message);
+                    scroll.post(() -> scroll.fullScroll(View.FOCUS_DOWN));
+                }
                 boolean isReady = message.contains("@@RESULT ready 1");
-                start.setEnabled(isReady);
+                setStartReady(isReady);
                 if (isReady) {
-                    start.setBackground(makeRipple(Color.parseColor("#00C853"), 0x33FFFFFF, 16));
-                    badgeDot.setBackground(makeBox(Color.parseColor("#00E676"), 0, 0, 10));
-                    badgeText.setText("SISTEMA PRONTO");
-                    badgeText.setTextColor(Color.parseColor("#00E676"));
+                    setBadge("#00E676", "SISTEMA PRONTO");
+                } else if (message.contains("@@RESULT session open")) {
+                    setBadge("#29B6F6", "SESSÃO ABERTA");
                 } else {
-                    start.setBackground(makeRipple(Color.parseColor("#262833"), 0x33FFFFFF, 16));
-                    badgeDot.setBackground(makeBox(Color.parseColor("#FF5252"), 0, 0, 10));
-                    badgeText.setText("NÃO PREPARADO");
-                    badgeText.setTextColor(Color.parseColor("#FF5252"));
+                    setBadge("#FF5252", "NÃO PREPARADO");
                 }
             });
         }).start();

@@ -24,6 +24,11 @@
 #include "drm_hw.h"
 #include "drm2kgsl/drm2kgsl_renderer.h"
 #include "oneios_drm2kgsl.h"
+#ifdef XH_AMDGPU
+#include "amdgpu/amdgpu_renderer.h"
+#include "gpu_pool.h"
+#include "virgl_fence.h"
+#endif
 
 typedef struct {
   xh_gpu3d base;
@@ -31,7 +36,11 @@ typedef struct {
   int ram_fd;
   uint64_t ram_phys, ram_size;
   uint8_t *pool_host;
-  uint64_t pool_size;
+  uint64_t pool_size, pool_fd_offset;
+  const char *render_node;
+#ifdef XH_AMDGPU
+  xh_gpu_pool response_pool;
+#endif
 } kgsl;
 
 static xh_gpu3d_log sink;
@@ -196,10 +205,22 @@ static int ctx_create(xh_gpu3d *b, uint32_t id, uint32_t capset_id, const char *
   (void)b;
   if (capset_id != XH_GPU_CAPSET_DRM) return -EINVAL;
   if (virgl_context_lookup(id)) return -EEXIST;
-  int fd = open(KGSL_DEVICE_NODE, O_RDWR | O_CLOEXEC);
+  kgsl *k = b->opaque;
+  int fd = open(k->render_node, O_RDWR | O_CLOEXEC);
   if (fd < 0) return -errno;
-  struct virgl_context *ctx = drm2kgsl_renderer_create(fd, name_length, name);        // owns fd, also when it fails
-  if (!ctx) return -ENOMEM;
+  struct virgl_context *ctx;
+#ifdef XH_AMDGPU
+  if (k->capset.context_type == VIRTGPU_DRM_CONTEXT_AMDGPU) {
+    ctx = amdgpu_renderer_create(fd, name_length, name);
+    if (!ctx) return -ENODEV;
+    int ret = amdgpu_renderer_set_response_pool(ctx, &k->response_pool);
+    if (ret) { ctx->destroy(ctx); return ret; }
+  } else
+#endif
+  {
+    ctx = drm2kgsl_renderer_create(fd, name_length, name);
+    if (!ctx) return -ENOMEM;
+  }
   ctx->ctx_id = id;
   ctx->capset_id = VIRGL_RENDERER_CAPSET_DRM;
   ctx->fence_retire = fence_retired;
@@ -314,8 +335,30 @@ static int create_blob_now(xh_gpu3d *b, uint32_t id, uint32_t res, uint32_t blob
     if (nchunks > 1) say(2, "gpu: resource %u: %llu bytes in %u segments as %d udmabufs", res, (unsigned long long)size, nentries, nchunks);
   }
   unsigned n = (unsigned)nchunks;
+#ifdef XH_AMDGPU
+  if (k->capset.context_type == VIRTGPU_DRM_CONTEXT_AMDGPU && n > 1) {
+    xh_gpu3d_chunks_free(chunks, n);
+    return -E2BIG;
+  }
+#endif
   int first = n ? fcntl(chunks[0].fd, F_DUPFD_CLOEXEC, 0) : -1;       // the resource's own fd
   if (n && first < 0) { xh_gpu3d_chunks_free(chunks, n); return -EMFILE; }
+#ifdef XH_AMDGPU
+  if (k->capset.context_type == VIRTGPU_DRM_CONTEXT_AMDGPU &&
+      blob_mem == XH_GPU_BLOB_HOST3D_GUEST) {
+    struct virgl_context *ctx = virgl_context_lookup(id);
+    struct virgl_resource *r = ctx && n == 1
+      ? virgl_resource_create_from_fd(res, VIRGL_RESOURCE_FD_DMABUF, first, NULL, 0, NULL)
+      : NULL;
+    if (!r && first >= 0) close(first);
+    xh_gpu3d_chunks_free(chunks, n);
+    if (!r) return -EINVAL;
+    r->map_size = size;
+    r->map_info = VIRGL_RENDERER_MAP_CACHE_CACHED;
+    ctx->attach_resource(ctx, r);
+    return 0;
+  }
+#endif
   if (blob_mem == XH_GPU_BLOB_GUEST) {
     // The display's surface: known as a dma-buf (its first, when it is chunked), for a context that attaches it.
     struct virgl_resource *r = n ? virgl_resource_create_from_fd(res, VIRGL_RESOURCE_FD_DMABUF, first, NULL, 0, NULL) : NULL;
@@ -378,6 +421,17 @@ static int map_blob(xh_gpu3d *b, uint32_t res, uint64_t *pool_offset, uint32_t *
 {
   kgsl *k = b->opaque;
   struct virgl_resource *r = virgl_resource_lookup(res);
+#ifdef XH_AMDGPU
+  if (k->capset.context_type == VIRTGPU_DRM_CONTEXT_AMDGPU) {
+    if (!r || !r->map_ptr || r->fd_offset < k->pool_fd_offset ||
+        r->map_size > k->pool_size ||
+        r->fd_offset - k->pool_fd_offset > k->pool_size - r->map_size)
+      return -EINVAL;
+    *pool_offset = r->fd_offset - k->pool_fd_offset;
+    *map_info = r->map_info;
+    return 0;
+  }
+#endif
   uint8_t *at = r ? r->map_ptr : NULL;
   if (!at || at < k->pool_host || at >= k->pool_host + k->pool_size || r->map_size > (uint64_t)(k->pool_host + k->pool_size - at)) return -EINVAL;
   *pool_offset = (uint64_t)(at - k->pool_host);
@@ -425,11 +479,19 @@ xh_gpu3d *xh_gpu3d_kgsl_open(int ram_fd, uint64_t ram_phys, uint64_t ram_size, v
                              uint64_t pool_size, xh_gpu3d_log log, const char **why)
 {
   static char reason[160];
-  static const char *const nodes[] = { KGSL_DEVICE_NODE, "/dev/udmabuf", "/dev/dma_heap/system" };
+  const char *amd_node = getenv("ONEIOS_AMDGPU_RENDER_NODE");
   *why = reason;
+#ifndef XH_AMDGPU
+  if (amd_node && *amd_node) {
+    *why = "AMDGPU support was not built";
+    return NULL;
+  }
+#endif
+  bool amd = amd_node && *amd_node;
+  const char *nodes[] = { amd ? amd_node : KGSL_DEVICE_NODE, "/dev/udmabuf", "/dev/dma_heap/system" };
   if (the) { snprintf(reason, sizeof reason, "the renderer is already open"); return NULL; }
   sink = log;
-  for (unsigned i = 0; i < 3; i++) {
+  for (unsigned i = 0; i < (amd ? 2u : 3u); i++) {
     int fd = open(nodes[i], (i == 2 ? O_RDONLY : O_RDWR) | O_CLOEXEC);
     if (fd < 0) { snprintf(reason, sizeof reason, "%s: %s", nodes[i], strerror(errno)); return NULL; }
     close(fd);
@@ -466,12 +528,25 @@ xh_gpu3d *xh_gpu3d_kgsl_open(int ram_fd, uint64_t ram_phys, uint64_t ram_size, v
   if (!k) { snprintf(reason, sizeof reason, "no memory"); return NULL; }
   virgl_log_set_handler(virgl_line, NULL, NULL);
   if (virgl_context_table_init() || virgl_resource_table_init(NULL)) { snprintf(reason, sizeof reason, "no memory for the renderer's tables"); free(k); return NULL; }
-  int fd = open(KGSL_DEVICE_NODE, O_RDWR | O_CLOEXEC);
-  k->capset.context_type = VIRTGPU_DRM_CONTEXT_MSM;
-  int r = fd < 0 ? -errno : drm2kgsl_renderer_probe(fd, &k->capset);       // keeps its own descriptor for the VBO
+  k->render_node = nodes[0];
+  k->pool_fd_offset = pool_pa - ram_phys;
+  int fd = open(k->render_node, O_RDWR | O_CLOEXEC);
+  int r;
+#ifdef XH_AMDGPU
+  if (amd) {
+    k->capset.context_type = VIRTGPU_DRM_CONTEXT_AMDGPU;
+    r = fd < 0 ? -errno : amdgpu_renderer_probe(fd, &k->capset);
+    if (!r) r = xh_gpu_pool_init(&k->response_pool, ram_fd, k->pool_fd_offset, pool_size);
+    if (!r) r = virgl_fence_table_init();
+  } else
+#endif
+  {
+    k->capset.context_type = VIRTGPU_DRM_CONTEXT_MSM;
+    r = fd < 0 ? -errno : drm2kgsl_renderer_probe(fd, &k->capset);
+  }
   if (fd >= 0) close(fd);
   if (r) {
-    snprintf(reason, sizeof reason, "KGSL refused the probe (%d): no device info, or no virtual buffer object (KGSL_MEMFLAGS_VBO)", r);
+    snprintf(reason, sizeof reason, "%s refused the renderer probe (%d)", k->render_node, r);
     free(k);
     return NULL;
   }
@@ -481,6 +556,10 @@ xh_gpu3d *xh_gpu3d_kgsl_open(int ram_fd, uint64_t ram_phys, uint64_t ram_size, v
                         .ctx_destroy = ctx_destroy, .submit = submit, .submit_fence = submit_fence, .create_blob = create_blob,
                         .map_blob = map_blob, .attach = attach, .unref = unref };
   the = &k->base;
+  if (amd) {
+    say(1, "gpu: experimental AMDGPU native context on %s", k->render_node);
+    return the;
+  }
   say(1, "gpu: drm2kgsl on %s: chip 0x%llx (gpu id %u), GPU addresses 0x%llx + %llu GiB, %u priorities; pool %llu MiB; "
       "guest pages in udmabufs of up to %llu MiB and %u runs",
       KGSL_DEVICE_NODE, (unsigned long long)k->capset.u.msm.chip_id, k->capset.u.msm.gpu_id, (unsigned long long)k->capset.u.msm.va_start,

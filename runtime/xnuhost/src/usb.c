@@ -15,6 +15,7 @@
 
 #if defined(__ANDROID__)
 #include <sys/system_properties.h>
+extern uint32_t __system_property_serial(const prop_info *pi);
 #endif
 
 static const char *const prop_names[XH_USB_PROPS] = { "sys.usb.state", "sys.usb.config", "sys.usb.controller" };

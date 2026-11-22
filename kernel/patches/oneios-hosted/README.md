@@ -239,6 +239,14 @@ Both built; not run.
   /Applications: kept` (or `dropped (...)`). If K stays 0 on a database that does hold the apps, the database does
   not store the names as plain text, and only `oneios-ls-keep=1` keeps it. The scan was tested on the Mac against
   sample bytes (a name across two 1 MiB chunks, `Notes.apps` against `Notes.app`); not on a real database.
+  **A56 / iOS 16.5 (2026-11-18):** 20F66's `/Applications` holds `DisplayCal.app`, a macOS bundle
+  (`Contents/Info.plist`, no `Info.plist` at its top), which lsd never registers (`Failed to load Info.plist`). The
+  test counted it, so every database read `names 172 of 173 apps of /Applications: dropped`. lsd then rebuilt it at
+  every boot and SpringBoard's main thread waited about 66 s after the first frame (thread samples: a lock wait in
+  LaunchServices under ControlCenterServices), with touches unanswered. Now an entry without its own `Info.plist` is
+  left out of the list. Tested on the phone so far only with `oneios-ls-keep=1` (database kept, the 66 s wait gone);
+  the changed test is built (kernel.kc de6a571c and later), but every boot since ran with `oneios-ls-keep=1`, so it is
+  not yet verified on its own.
 - **0044, `oneios-enable-jobs`** (default `com.apple.analyticsd`; `-` for none). Before launchd, each listed job's
   `<true/>` in the Data store's `/private/var/db/com.apple.xpc.launchd/disabled.plist` becomes `<false/>` (enabled),
   and the file is written again (root's, 0644). The image's daemon policy disabled analyticsd (vphone's base27); then
@@ -1078,3 +1086,56 @@ offer and DroidVMVirtioGpuDisplay.cpp's resources carry the scanout format: `sta
 (`oneios-display: properties: ...`) and each surface format the compositor swaps (`oneios-display: the compositor
 swaps format 'BGRA' ...: taken`). Without the boot argument the frames take the path they took before. Not compiled
 yet: the kernel build, prelink and a PC boot are the next step (`display/README.md`).
+
+## 0074-0077: the A56 touch investigation (iOS 16.5 on the Galaxy A56, 2026-11-18/19)
+
+- **0074** `oneios-dq-dump=N`: the first N shared data queue entries (IOHIDEvents queued for backboardd) in hex. Off
+  without it.
+- **0075** `oneios-dq-notify=1`: counts IODataQueue's "data available" notifications and what each send returned, one
+  `oneios-dq-notify:` line every 2 s. Phone (kernel.kc a01f38e3): 1521 sends for 1531 touch events, all `ok`, none
+  `already queued`: the kernel tells backboardd of every touch at once, so the lag is not in the kernel's delivery.
+- **0076** the return's graceful window sends `logd` SIGTERM (`oneios_power_request()`, docs/booter.md "The return");
+  the A56 switch passes `--set return-graceful-ms=4000`. Seen working on the phone (`SIGTERM to logd (1 process(es))`).
+  It turned out not to be needed for the log: the log was never lost, its times are compressed about 40x
+  (`tools/oneios-tool/README.md`, ioslog).
+- **0077** `oneios-log-debug=SUBSYSTEM[,...]`: before launchd, a Debug logging profile per subsystem in
+  `/private/var/preferences/Logging/Subsystems`. Phone (kernel.kc fa57bc09, `com.apple.BackBoard,com.apple.SpringBoard`):
+  both `written (0)`, and their Debug lines are in the log (logd reads that folder on iOS 16.5).
+- What the touch work found so far: SpringBoard's main thread waited ~66 s after the first frame for LaunchServices
+  (0043 above, fixed); after that the lock screen draws but ignores touches although backboardd processes them
+  (`touchstats`) and has a touch stream to SpringBoard. Cause and fix: 0078-0079 below (event layout).
+
+## 0078-0079: the A56 touch's cause and its fix (2026-11-19/21)
+
+- **0078** `oneios-dq-head=N`: at each IODataQueue "data available" notification, the bytes of the entry at the
+  queue's head (IOHIDFamily's event queues write without `IOSharedDataQueue::enqueue`, so 0074 printed nothing).
+  Phone (kernel.kc 9f75a2c9): every touch entry is 0x178 bytes: a 28-byte header {timestamp, sender, options,
+  attribute size, event count 2}, a digitizer event of 0xa0 bytes (x/y/z as doubles at 16/24/32, transducer type 2,
+  identity, event mask 0x804, orientation "quality" with radii 5.0 as doubles), then a second 28-byte header and the
+  child digitizer event (depth 1).
+- **The cause.** 20F66's IOKit, read in its shared cache: `IOHIDEventCreateWithBytes` takes the 28-byte header and
+  then the events back to back (each by its own size), and `IOHIDEventGetFloatValueWithOptions` reads a digitizer's
+  x/y/z as IOFixed at 16/20/24 (`scvtf` and 1/65536), pressure/aux/twist as floats at 52/56/60, the orientation type at
+  64: a 0x68-byte event. So backboardd parsed iOS 27's events as garbage: it counted them (`touchstats`), SpringBoard
+  got no touch event, the lock screen never moved.
+- **0079** `oneios-hid16=1`: at each notification, the queue's unread elements made only of iOS 27 digitizer events
+  are rewritten in place into 20F66's layout (header kept, events back to back, IOFixed and floats from the doubles
+  without floating point, the rest of the entry zeroed). An element written while the queue was not empty gets no
+  notification and stays unconverted. Tested on the PC against the dumped entry (x 0.50002, y 0.43588, finger,
+  identity 2, mask 0x804, radius 5.00). Phone, 2026-11-21 (kernel.kc e831dec7, `oneios-hid16=1`): touch works; the
+  test session drew 371 frames (`swapstat validated 371`) against about 10 before, and the owner confirmed it by hand.
+
+## 0080: entitlements an older iOS lacks (2026-11-21)
+
+- **0080** `oneios-grant=PROC:ENTITLEMENT[,...]` (iokit/Kernel/IOUserClient.cpp): when AMFI has no value for an
+  entitlement that `IOUserClient::copyClientEntitlement` is asked for, and the process name (as `proc_name` gives it)
+  and the entitlement match a listed pair, the answer is `kOSBooleanTrue`. One line per pair, the first time:
+  `oneios-grant: configd[31] given com.apple.networking.ionetworkstack.user-client`. Off without the argument.
+- Why: the A56's iOS 16.5 configd (InterfaceNamer) opens IONetworkStack to name en0. iOS 27's
+  `IONetworkStackUserClient::initWithTask` wants root and `com.apple.networking.ionetworkstack.user-client`, which
+  20F66's configd does not carry: the open failed (`0xe00002c2`), en0 was never named and wifid found no Wi-Fi
+  interface ("Device manager not present").
+- Tested on the A56 (kernel.kc `00d8b9cc`, 2026-11-21): the grant line, then `ONEIOS WIFI: first naming (en0
+  attached ...) by configd`, en0 up (IFF_UP) and wifid's Apple80211 requests (channels info: the host's 38
+  channels). Not yet seen: a scan request (none in a 60 s session without the Wi-Fi settings open) or a join.
+  The A56's switch script passes `oneios-grant=configd:com.apple.networking.ionetworkstack.user-client`.

@@ -1,7 +1,7 @@
 diff --git a/iokit/Kernel/IOUserClient.cpp b/iokit/Kernel/IOUserClient.cpp
 --- a/iokit/Kernel/IOUserClient.cpp
 +++ b/iokit/Kernel/IOUserClient.cpp
-@@ -5134,6 +5134,69 @@
+@@ -5134,6 +5134,71 @@
  	return is_io_registry_entry_set_properties( connection, properties, propertiesCnt, result );
  }
  
@@ -20,7 +20,7 @@ diff --git a/iokit/Kernel/IOUserClient.cpp b/iokit/Kernel/IOUserClient.cpp
 +static int hosted_iouc_state = -1;
 +static uint32_t hosted_iouc_lines;
 +static void
-+hosted_iouc_trace(IOUserClient *client, uint32_t selector, IOReturn ret)
++hosted_iouc_trace(IOUserClient *client, uint32_t selector, const IOExternalMethodArguments *args, IOReturn ret)
 +{
 +	if (hosted_iouc_state < 0) {
 +		hosted_iouc_state = PE_parse_boot_argn("oneios-iouc", hosted_iouc_names, sizeof(hosted_iouc_names)) && hosted_iouc_names[0];
@@ -62,7 +62,9 @@ diff --git a/iokit/Kernel/IOUserClient.cpp b/iokit/Kernel/IOUserClient.cpp
 +	/* also at call 16, 64, 256, ...: how often a call that keeps its answer is made */
 +	if ((e->last != ret || (e->calls >= 16 && (e->calls & (e->calls - 1)) == 0 && (__builtin_ctz(e->calls) & 1) == 0)) && hosted_iouc_lines < 600) {
 +		hosted_iouc_lines++;
-+		IOLog("oneios-iouc: %s[%d] %s selector %u -> 0x%x (call %u)\n", name, proc_selfpid(), meta->getClassName(), selector, ret, e->calls);
++		IOLog("oneios-iouc: %s[%d] %s selector %u -> 0x%x (call %u; scalar in/out %u/%u; struct in/out %u/%u)\n", name, proc_selfpid(), meta->getClassName(), selector, ret, e->calls,
++		    args->scalarInputCount, args->scalarOutputCount,
++		    args->structureInputSize, args->structureOutputSize);
 +	}
 +	e->last = ret;
 +}
@@ -71,32 +73,32 @@ diff --git a/iokit/Kernel/IOUserClient.cpp b/iokit/Kernel/IOUserClient.cpp
  /* Routine io_user_client_method */
  kern_return_t
  is_io_connect_method_var_output
-@@ -5207,6 +5270,9 @@
+@@ -5207,6 +5272,9 @@
  
  	if (kIOReturnSuccess == ret) {
  		ret = client->callExternalMethod(selector, &args);
 +#if XNU_HOSTED
-+		hosted_iouc_trace(client, selector, ret);
++		hosted_iouc_trace(client, selector, &args, ret);
 +#endif
  	}
  
  	*scalar_outputCnt = args.scalarOutputCount;
-@@ -5328,6 +5394,9 @@
+@@ -5328,6 +5396,9 @@
  	}
  	if (kIOReturnSuccess == ret) {
  		ret = client->callExternalMethod( selector, &args );
 +#if XNU_HOSTED
-+		hosted_iouc_trace(client, selector, ret);
++		hosted_iouc_trace(client, selector, &args, ret);
 +#endif
  	}
  
  	*scalar_outputCnt = args.scalarOutputCount;
-@@ -5442,6 +5511,9 @@
+@@ -5442,6 +5513,9 @@
  	}
  	if (kIOReturnSuccess == ret) {
  		ret = client->callExternalMethod( selector, &args );
 +#if XNU_HOSTED
-+		hosted_iouc_trace(client, selector, ret);
++		hosted_iouc_trace(client, selector, &args, ret);
 +#endif
  	}
  

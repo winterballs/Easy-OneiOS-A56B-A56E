@@ -717,6 +717,10 @@ builds `SUPPORTED_CHANNELS` from the same list (active unless passive, DFS flag 
   the file is the 17 characters of the address and a NUL (`od -c`), and `br_bt_address` took the NUL for a
   character that is not part of an address. Fixed 2026-11-12 (`hci.c`: the text ends at the first NUL; a test with
   the phone's layout); not yet run on the phone.
+- **Galaxy A56 (SM-A566E, Android 16) [F, 2026-11-21]:** the HAL is the stable **AIDL**
+  `android.hardware.bluetooth.IBluetoothHci/default` (process `android.hardware.bluetooth-service.default`, pid
+  996; `vendor.samsung.hardware.bluetooth.ISehBluetooth/default` beside it), registered with servicemanager on
+  `/dev/binder`. hwservicemanager has no Bluetooth HIDL service: the HIDL probe logs `Broken pipe`.
 
 ### iOS side (`drivers/bluetooth`, port of iOSPlus10 `patches/laurel/xnu/2600-laurel-bluetooth-wcn3990.patch`)
 
@@ -745,6 +749,20 @@ builds `SUPPORTED_CHANNELS` from the same list (active unless passive, DFS flag 
   `sendHciCommand` returns is answered at once. No `initializationComplete` within 15 s
   (`ONEIOS_BT_INIT_TIMEOUT_MS`) is a failure with a line naming SELinux. `br_hci_hidl_probe()` asks for the
   service once at xnuhost's start. `ONEIOS_HWBINDER` names another binder device (the PC test).
+- AIDL mode (same file, 2026-11-21, for the A56): when the HIDL probe finds nothing, `br_hci_hidl_probe()` asks
+  servicemanager (`/dev/binder`, `IServiceManager::getService` code 1) for `android.hardware.bluetooth.IBluetoothHci/default`
+  and returns 20; `br_hci_open_hidl` then speaks AIDL on the same two threads: `initialize` 2, `sendAclData` 3,
+  `sendHciCommand` 4, `sendIsoData` 5, `sendScoData` 6, `close` 1; callbacks `aclDataReceived` 1, `hciEventReceived` 2,
+  `initializationComplete` 3, `isoDataReceived` 4, `scoDataReceived` 5, plus `INTERFACE_TRANSACTION`, ping, version
+  and hash. Parcels (`hidl_parcel.c`, `aidl_*`): token = strict-mode 0, work source -1, header, String16; our callback
+  binder carries stability 0x3f (VINTF); byte[] = length + bytes. The header is `SYST` first (what `wifi/aidl_parcel.c`
+  sends the vendor supplicant), `VNDR` if `initialize` is refused. `ONEIOS_BINDER` names another device.
+  **Tested on the A56 2026-11-21 (one session):** `bluetooth: the HAL is the AIDL one (...)`, `on: the phone's
+  controller through its HAL, address ec:b5:50:..`, guest `ONEIOS BT: transport up`. The HAL was **not opened**: iOS
+  16.5's bluetoothd crashes (SIGSEGV) right after `BT driver=...`, before it opens the transport, after logging
+  `marconi-bt: Unable to match bluetooth service in device tree` (unified log, `oneios-tool ioslog`). So `initialize`,
+  the header choice and the callbacks are untested on a real HAL. Built with `-Werror`; `make test-binder` was skipped
+  on the PC (no binderfs in the WSL kernel) and has no AIDL case yet.
 - `bridge_dev.c`: an `OB_HCI_OPEN` while the controller is failed (the HAL died or never finished) closes it and
   opens it again, so a new bluetoothd client starts over.
 - `hidl_parcel.c`: the parcels (interface token, `hidl_string`, `hidl_vec<uint8_t>` as scatter-gather buffer

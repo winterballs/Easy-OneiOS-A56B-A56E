@@ -223,13 +223,14 @@ log_scan() { # <first byte, from 1> <stage so far>
             else if (panic == "" && t ~ /^panic\(cpu [0-9]+ caller 0x[0-9a-f]+\): /) { panic = t; sub(/^panic\([^)]*\): /, "", panic) }
             if (index(t, "backboardd[")) s(8)
             if (index(t, "SpringBoard[") || index(t, "crashed: SpringBoard.")) s(9)
+            if (index(t, "datamigrat") || index(t, "datamigrator")) s(10)
             next
         }
         line ~ /^xnuhost I / {
             t = substr(line, 11)
             if (index(t, "xnuhost: session ABI ") == 1) { st = 1; boot = 1; panic = ""; why = ""; code = ""; err = "" }
             else if (index(t, "cpu0: entering the kernel at ") == 1) s(2)
-            else if (index(t, "guest ready: first frame") == 1) s(10)
+            else if (index(t, "guest ready: first frame") == 1) s(11)
             else if (index(t, "stopping: ") == 1) { why = substr(t, 11); sub(/ \(reason [0-9]+, code [0-9]+\)$/, "", why) }
             else if (t ~ /^exit [0-9]+$/) code = substr(t, 6)
             next
@@ -255,7 +256,8 @@ stage_text() { # <stage of log_scan>
         7) echo "launchd is running" ;;
         8) echo "backboardd started" ;;
         9) echo "SpringBoard started" ;;
-        10) echo "iOS is up: waiting for its first frame" ;;
+        10) echo "Preparing system data - migrating storage, please wait..." ;;
+        11) echo "iOS is up: waiting for its first frame" ;;
     esac
 }
 # One line on why xnuhost ended, from the last 64 KiB of its log.
@@ -273,18 +275,16 @@ why_ended() {
             else print "xnuhost ended"
         }'
 }
-# The display helper runs and has the guest's picture: its first frame is
-# posted, or xnuhost reported ready and the helper's layer is up. Its layer is
-# above the boot screen's, so the picture covers the boot screen first and the
-# boot screen is taken away under it.
+# The helper initially posts a blank buffer. Keep the boot status active
+# until xnuhost has copied visible guest pixels and the helper has a layer.
 display_up() {
+    [ -e "$SESSION/ready" ] || return 1
     for dp in $(cat "$CTL/display.pid" 2>/dev/null); do
         case "$(cat "$P/$dp/cmdline" 2>/dev/null | tr '\0' ' ')" in
             *OneiOSDisplay*|*oneios-display*) ;;
             *) continue ;;
         esac
-        grep -q 'oneios-display: first frame posted' "$CTL/display.log" 2>/dev/null && return 0
-        [ -e "$SESSION/ready" ] && grep -q 'oneios-display: layer up' "$CTL/display.log" 2>/dev/null && return 0
+        grep -q 'oneios-display: layer up' "$CTL/display.log" 2>/dev/null && return 0
     done
     return 1
 }
@@ -710,11 +710,90 @@ case "$MODE" in
             starting|running) ;;
             *) die_inner "the switch is no longer starting (state '$ST'): xnuhost is not started" ;;
         esac
+        # The Metal accelerator. iOS 16.5's (20F66) stock Metal opens
+        # AGXAccelerator as an IOGPU device client (type 1), which NativeAdreno
+        # does not serve (0xe00002c7): backboardd then has a Metal device that
+        # cannot draw, and the panel stays black. Without the accelerator
+        # CoreAnimation composites on the CPU and the frames reach the scanout
+        # (docs/gpu.md). So for 20F66 the accelerator is not published
+        # (oneios-gpu-metal=0, which wins over droidvm-gpu-metal=1 in the
+        # image's boot arguments). ONEIOS_GPU_METAL=0|1 forces either way.
+        GPU_METAL="${ONEIOS_GPU_METAL:-}"
+        if [ -z "$GPU_METAL" ]; then
+            case "$(conf /data/image.conf build)" in 20F66) GPU_METAL=0 ;; esac
+        fi
+        set --
+        if [ -n "$GPU_METAL" ]; then
+            case "$GPU_METAL" in 0|1) ;; *) die_inner "ONEIOS_GPU_METAL must be 0 or 1, not '$GPU_METAL'" ;; esac
+            # The image's boot arguments, else xnuhost's default (config.c):
+            # --boot-args replaces both, so they are carried over whole.
+            BA=$(conf /data/image/overlay/userland/xnuhost.conf boot-args)
+            if [ -z "$BA" ] && [ "$(conf /data/image.conf build)" = 20F66 ]; then
+                # The A56's 20F66 session as run on the phone (2026-11-18, the
+                # lock screen): no 3D virtio-gpu, no Metal, iOS 16's bootstrap
+                # replies (kernel 0069), the legacy unit scale and a 60 Hz vsync (2026-11-21: fewer frames for the CPU compositor). 2026-11-21 also: oneios-hid16=1 (kernel 0079: touch events in 16.5's layout), oneios-grant (kernel 0080: configd may name en0, so Wi-Fi comes up), oneios-ls-keep=1 (kernel 0043).
+                # The trace arguments of those runs (oneios-iouc, oneios-iokit,
+                # oneios-ubt*, sheng-exc-name, oneios-dq-dump,
+                # oneios-display-report) are left out: ONEIOS_DIAG_BOOTARGS adds them.
+                BA="debug=0x14e serial=3 -v kt_fixed_zones=120 -no_slto_panic ml-timeout-lock-panic-scale=40 tlto_us=0 sheng-smp=1 armcpu-self-ipi=1 armcpu-spi-ipi=1 use_contiguous_hint=0 interrupt-masked-debug-mode=0 sched_preemption_disable_debug_mode=0 wdt=-1 native-source-storage=1 vgpu-3d=0 droidvm-gpu-metal=0 ool_port_array_enforced=0 offline-legacy-unit-scale=3 sheng-vsync=60 oneios-legacy-bootstrap-replies=1 oneios-hid16=1 oneios-grant=configd:com.apple.networking.ionetworkstack.user-client oneios-ls-keep=1"
+            fi
+            [ -n "$BA" ] || BA="debug=0x14e serial=3 -v kt_fixed_zones=120 -no_slto_panic ml-timeout-lock-panic-scale=40 tlto_us=0 sheng-smp=1 armcpu-self-ipi=1 armcpu-spi-ipi=1 use_contiguous_hint=0 interrupt-masked-debug-mode=0 sched_preemption_disable_debug_mode=0 wdt=-1 native-source-storage=1 vgpu-3d=1 droidvm-gpu-metal=1"
+            BA=$(echo " $BA ${ONEIOS_DIAG_BOOTARGS:-} " | sed 's/ oneios-gpu-metal=[^ ]*//g; s/^ *//; s/ *$//')
+            set -- --boot-args "$BA oneios-gpu-metal=$GPU_METAL"
+            echo "oneios inner: Metal accelerator: oneios-gpu-metal=$GPU_METAL"
+        fi
+        # 20F66's text fixups (the kernel applies each only where the original
+        # bytes match). A text-fixup on the command line replaces the image's
+        # xnuhost.conf ones, so keybagd's (roottweak's) is carried here too.
+        # QuartzCore: CoreAnimation uses IOMobileFramebuffer's vsync
+        # notifications (selector 72, which the display backend serves) only
+        # with CA_FORCE_TIMER set or on an old ChipID (0x7000..0x8010);
+        # otherwise it never asks for vsync and the panel stays on the boot
+        # logo. The fixup makes that check answer yes (cset w8, cc -> mov w8, #1
+        # at 0x188364684 in subcache .03; docs/a56-guide.md).
+        # 20F66's mediaserverd (and TVRemoteConnectionService) are refused by
+        # 24A446's Sandbox at exec (mac_cred_label_update_execve, error 1:
+        # their profiles are not this kernel's); without mediaserverd
+        # SpringBoard waits forever for com.apple.coremedia.systemcontroller.xpc
+        # on the boot logo. Kernel 0073's oneios-mac-exec-skip runs them
+        # without their sandbox profile.
+        if [ "$(conf /data/image.conf build)" = 20F66 ]; then
+            case " $* " in
+                *" --boot-args "*) BA_NOW=$2; shift 2; set -- --boot-args "$BA_NOW oneios-mac-exec-skip=mediaserverd,TVRemoteConnectionService" "$@" ;;
+                *) BA=$(conf /data/image/overlay/userland/xnuhost.conf boot-args)
+                   [ -n "$BA" ] && set -- --boot-args "$BA oneios-mac-exec-skip=mediaserverd,TVRemoteConnectionService" "$@" ;;
+            esac
+        fi
+        if [ "$(conf /data/image.conf build)" = 20F66 ]; then
+            set -- "$@" --set text-fixup=keybagd,cf5c,600000b4,1f2003d5 \
+                --set text-fixup=dyld_shared_cache_arm64.03,15e4684,e8279f1a,28008052
+            echo "oneios inner: 20F66 text fixups: keybagd, QuartzCore hardware vsync"
+            # The display: the helper's shared frame, composited on the CPU.
+            set -- "$@" --display shm --gpu 2d
+            # The guest frame: the panel's 1080x2340 at @3x, pinned. iOS then
+            # sees a 360x780-point screen, a width no iPhone has: 20F66's UIKit
+            # finds no status bar visual provider and shows "Please see
+            # rdar://45025538" on screen. iPhone X's 1125x2436 (375x812 points,
+            # the image's d22ap) removes that cause, but on the phone
+            # (2026-11-18) SpringBoard then aborted in a loop (SIGABRT every
+            # ~11 s, Apple logo); why is open. ONEIOS_FRAME=WxH tries another
+            # size; ONEIOS_FRAME=panel asks the panel's mode.
+            FRAME="${ONEIOS_FRAME:-1080x2340}"
+            case "$FRAME" in
+                panel) echo "oneios inner: guest frame: the panel's mode (ONEIOS_FRAME=panel)" ;;
+                [1-9]*x[1-9]*)
+                    FW=${FRAME%x*}; FH=${FRAME#*x}
+                    case "$FW$FH" in *[!0-9]*) die_inner "ONEIOS_FRAME must be WxH or panel, not '$FRAME'" ;; esac
+                    set -- "$@" --width "$FW" --height "$FH" --hz 60 --scale 3
+                    echo "oneios inner: guest frame ${FW}x${FH} @3x ($((FW / 3))x$((FH / 3)) points)" ;;
+                *) die_inner "ONEIOS_FRAME must be WxH or panel, not '$FRAME'" ;;
+            esac
+        fi
         AT="exec of /data/runtime/$R_XNUHOST"
         echo "oneios inner: $(date '+%F %T') starting /data/runtime/$R_XNUHOST (pid $$)"
         exec "/data/runtime/$R_XNUHOST" --session-abi $ABI --mode takeover \
             --runtime /data/runtime --image /data/image --data /data/data --session /data/session \
-            --ram 4096M --set ram-giveback=0 --set ram-prefault=1 --set ram-lock=1 --set wifi=sim
+            --ram 4096M --set ram-giveback=0 --set ram-prefault=1 --set ram-lock=1 --set wifi=auto --set return-graceful-ms=4000 "$@"
         echo "oneios inner: could not exec xnuhost"
         exit 71
         ;;
@@ -912,11 +991,11 @@ case "$MODE" in
         # far as starting xnuhost (60 s), xnuhost ended, a return was asked
         # ($SESSION/return.request: the volume keys, the guest, adb), or the
         # guest never said it is up ($SESSION/ready) within ONEIOS_RETURN_MAX
-        # seconds of its start (600; 0 = no limit).
+        # seconds of its start (1800; 0 = no limit).
         echo $$ > "$CTL/watcher.pid"
         out_of_the_way
-        MAX="${ONEIOS_RETURN_MAX:-600}"
-        case "$MAX" in ''|*[!0-9]*) MAX=600 ;; esac
+        MAX="${ONEIOS_RETURN_MAX:-1800}"
+        case "$MAX" in ''|*[!0-9]*) MAX=1800 ;; esac
         awake() { echo oneios_session 2>/dev/null > "$T/sys/power/wake_lock"; }
         SCREEN=""
         go() {
@@ -964,7 +1043,7 @@ case "$MODE" in
                 go "xnuhost $pid ended (last log lines: $(tail -n 3 "$SESSION/xnuhost.log" 2>/dev/null | tr '\n' '|' | cut -c1-300))"
             fi
             if [ "$MAX" -gt 0 ] && [ ! -e "$SESSION/ready" ] && [ $t -ge "$MAX" ]; then
-                SCREEN="iOS did not come up within ${MAX} s"
+                SCREEN="iOS did not show a visible frame within ${MAX} s"
                 go "the guest did not report ready within ${MAX}s"
             fi
             # Nothing else keeps the phone awake with One UI's framework gone:
@@ -993,7 +1072,7 @@ P_MODEL=$(getprop ro.product.model)
 P_DEVICE=$(getprop ro.product.device)
 P_SOC=$(getprop ro.soc.model)
 case "$P_MODEL:$P_DEVICE:$P_SOC" in
-    SM-S928*:e3q:SM8650|SM-A566E:a56x:s5e8855) ;;
+    SM-S928*:e3q:SM8650|SM-A566*:a56x:s5e8855) ;;
     *) refuse "unsupported device: $P_MODEL ($P_DEVICE, $P_SOC)" ;;
 esac
 
@@ -1299,5 +1378,5 @@ else
 fi
 
 echo "=== [5/5] $(date +%T) Session running ==="
-echo "Auto-return to One UI: when xnuhost ends, on $SESSION/return.request, or without $SESSION/ready after ${ONEIOS_RETURN_MAX:-600}s"
+echo "Auto-return to One UI: when xnuhost ends, on $SESSION/return.request, or without $SESSION/ready after ${ONEIOS_RETURN_MAX:-1800}s"
 echo "=== ONEIOS SESSION LAUNCHED ==="

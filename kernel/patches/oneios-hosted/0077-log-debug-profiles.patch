@@ -1,0 +1,67 @@
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -9201,6 +9201,55 @@
+  *   oneios-swap: /private/var/vm: made, root:wheel 0755 (0), on /private/var (apfs, read-write)
+  */
+ int oneios_kern_mkdir(const char *path, int mode, vfs_context_t ctx);      /* 0004 */
++#if XNU_HOSTED
++/*
++ * OneiOS hosted (0077), a debugging aid: oneios-log-debug=SUBSYSTEM[,SUBSYSTEM...] writes, before launchd, a logging
++ * profile per subsystem into the Data store (/private/var/preferences/Logging/Subsystems/SUBSYSTEM.plist, Enable and
++ * Persist at Debug), so that subsystem's Info and Debug messages reach the unified log on disk (oneios-tool ioslog).
++ * Without the argument nothing is written; files of an earlier boot stay until removed. Whether logd reads this
++ * folder on iOS 16 is the test's question. One line per subsystem:
++ *   oneios-log-debug: com.apple.BackBoard: written (0)
++ */
++static void
++oneios_log_debug(void)
++{
++	static const char folders[][48] = {"/private/var/preferences", "/private/var/preferences/Logging",
++		                           "/private/var/preferences/Logging/Subsystems"};
++	static const char plist[] =
++	    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
++	    "<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n"
++	    "<plist version=\"1.0\">\n<dict>\n\t<key>DEFAULT-OPTIONS</key>\n\t<dict>\n\t\t<key>Level</key>\n\t\t<dict>\n"
++	    "\t\t\t<key>Enable</key>\n\t\t\t<string>Debug</string>\n\t\t\t<key>Persist</key>\n\t\t\t<string>Debug</string>\n"
++	    "\t\t</dict>\n\t</dict>\n</dict>\n</plist>\n";
++	char list[256] = "";
++	vfs_context_t ctx = vfs_context_current();
++	if (!PE_parse_boot_argn("oneios-log-debug", list, sizeof(list)) || list[0] == 0) {
++		return;
++	}
++	for (unsigned i = 0; i < sizeof(folders) / sizeof(folders[0]); i++) {
++		(void)oneios_kern_mkdir(folders[i], 0755, ctx);
++	}
++	char *name = list;
++	while (name != NULL && *name) {
++		char *next = strchr(name, ',');
++		if (next != NULL) {
++			*next++ = 0;
++		}
++		char path[160];
++		vnode_t vp = NULLVP;
++		int resid = 0;
++		snprintf(path, sizeof(path), "%s/%s.plist", folders[2], name);
++		int error = vnode_open(path, O_CREAT | O_TRUNC | FWRITE | O_NOFOLLOW, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH, 0, &vp, ctx);
++		if (!error) {
++			error = vn_rdwr(UIO_WRITE, vp, (caddr_t)(uintptr_t)plist, (int)(sizeof(plist) - 1), 0, UIO_SYSSPACE,
++			    IO_NOAUTH | IO_UNIT, vfs_context_ucred(ctx), &resid, vfs_context_proc(ctx));
++			(void)vnode_close(vp, FWRITE, ctx);
++		}
++		printf("oneios-log-debug: %s: %s (%d)\n", name, error ? "not written" : "written", error);
++		name = next;
++	}
++}
++#endif /* XNU_HOSTED */
+ 
+ static void
+ oneios_swap_folder(void)
+@@ -9661,6 +9710,7 @@
+ 	oneios_feature_flags_off(p, scratch);         /* 0048 */
+ 	oneios_jobs_disable();                        /* 0053 */
+ 	oneios_swap_folder();                         /* 0057 */
++	oneios_log_debug();                           /* 0077 */
+ #endif
+ }
+ 

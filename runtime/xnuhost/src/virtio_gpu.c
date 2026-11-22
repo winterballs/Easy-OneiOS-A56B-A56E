@@ -191,15 +191,27 @@ static bool backing_read(const resource *r, uint64_t offset, uint8_t *out, uint6
   return length == 0;
 }
 
-// The guest's display driver also scans out the boot framebuffer itself (DroidVMVirtioGpuDisplay.cpp's `boot`
-// resource: the kernel console until the compositor's first frame, and later whenever a blank or CPU-copied frame was
-// drawn there). That picture is shown like any other, but it is the console's: the guest is ready (session/ready)
-// at the first frame of a surface of its own.
-static void frame_shown(gpu_state *g, const gpu_entry *entries, unsigned n)
+// A console flush or an all-black compositor buffer must not stop the boot timeout.
+static void frame_shown(gpu_state *g, const gpu_entry *entries, unsigned n,
+                        const xh_display *d, uint32_t x, uint32_t y, uint32_t w, uint32_t h)
 {
   if (g->first_frame || (n && g_info.video[0] && entries[0].addr == g_info.video[0])) return;
-  g->first_frame = true;
-  xh_guest_ready();
+
+  const bool half = d->format == XH_PIXELS_RGBA16F;
+  const unsigned bpp = half ? 8 : 4;
+  for (uint32_t row = 0; row < h; row++) {
+    const uint8_t *pixel = d->pixels + (size_t)(y + row) * d->stride + (size_t)x * bpp;
+    for (uint32_t col = 0; col < w; col++, pixel += bpp) {
+      // Ignore alpha and padding. In half-float, both signs of zero are black.
+      const unsigned rgb = half ? pixel[0] | (pixel[1] & 127) | pixel[2] |
+                                  (pixel[3] & 127) | pixel[4] | (pixel[5] & 127)
+                                : pixel[0] | pixel[1] | pixel[2];
+      if (!rgb) continue;
+      g->first_frame = true;
+      xh_guest_ready();
+      return;
+    }
+  }
 }
 
 static bool rect_ok(const gpu_rect *r, uint32_t w, uint32_t h)
@@ -322,7 +334,7 @@ static uint32_t flush_blob(gpu_state *g, const blob *b, const gpu_rect *rect)
   flush_note(flush_now_us() - t0, (uint64_t)w * hgt * gbpp);
   if (status == RESP_OK_NODATA && w && hgt) {
     xh_display_flush(rect->x, rect->y, w, hgt);
-    frame_shown(g, b->entries, b->nentries);
+    frame_shown(g, b->entries, b->nentries, d, rect->x, rect->y, w, hgt);
   }
   return status;
 }
@@ -646,8 +658,10 @@ static uint32_t command(gpu_state *g, const uint8_t *req, size_t size, uint8_t *
       for (uint32_t y = 0; y < hgt && w; y++)
         memcpy(d->pixels + (size_t)(rect.y + y) * d->stride + (size_t)rect.x * r->dbpp,
                r->pixels + ((size_t)(rect.y + y) * r->width + rect.x) * r->dbpp, (size_t)w * r->dbpp);
-      if (w && hgt) xh_display_flush(rect.x, rect.y, w, hgt);
-      frame_shown(g, r->backing, r->nbacking);
+      if (w && hgt) {
+        xh_display_flush(rect.x, rect.y, w, hgt);
+        frame_shown(g, r->backing, r->nbacking, d, rect.x, rect.y, w, hgt);
+      }
     }
     return RESP_OK_NODATA;
   }

@@ -114,7 +114,14 @@ everything; a guest with no shutdown helper (or any image before this) simply re
 Log: `return: graceful shutdown asked; iOS has up to N ms`, then `return: iOS shut down in N ms` or
 `return: graceful shutdown timed out after N ms; stopping`. State machine: `runtime/xnuhost/src/return.c`
 (unit-tested). **The guest half is the Mac's to build:** a guest helper that `oneios_power_request()` reaches which
-runs iOS's clean power-off (a halt, so xnuhost exits and the return completes, not a reboot). The host half above
+runs iOS's clean power-off (a halt, so xnuhost exits and the return completes, not a reboot). **First part (hosted
+patch 0076, 2026-11-18):** `oneios_power_request()` now sends `logd` SIGTERM (from a thread call), so iOS's unified log
+reaches the Data store before the kill; without it, `oneios-tool ioslog` showed only the first ~40 s of each boot.
+iOS does not halt, so xnuhost waits until the deadline (the A56 switch passes `--set return-graceful-ms=4000`). Log:
+`oneios-power: return asked: SIGTERM to logd (N process(es))`. Phone, 2026-11-19 (kernel.kc de6a571c): the line came
+(`SIGTERM to logd (1 process(es))`, then `graceful shutdown timed out after 4015 ms`), but the Data store's log still
+holds user-space entries only from the first ~2 s after logd starts (Persist gets one ~1 MB file per boot), so the
+loss is not the kill: logd stops persisting early in the boot. Cause not yet found. The host half above
 works and is tested without it; the end-to-end (iOS saving its overlay) is not yet verified. The kernel's own
 shutdown path does nothing to the host: a guest halt or PSCI SYSTEM_OFF/RESET only sets `xh_stop` (no `reboot(2)`,
 nothing under `/sys/power`; section 2.9), which the return completes.

@@ -2,6 +2,9 @@ import os
 import subprocess
 import shutil
 import zipfile
+import hashlib
+import re
+import tarfile
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 SRC_DIR = os.path.join(APP_DIR, "src")
@@ -27,9 +30,36 @@ if os.path.exists(DEX_DIR):
     shutil.rmtree(DEX_DIR)
 os.makedirs(DEX_DIR, exist_ok=True)
 
-print("[1] Compiling Manager.java with javac...")
+print("[0] Checking assets/bootstrap.tar.gz against the pin in Manager.java...")
 java_src = os.path.join(SRC_DIR, "Manager.java")
-cmd_javac = ["javac", "-cp", SDK_JAR, "-d", CLASSES_DIR, java_src]
+with open(java_src, encoding="utf-8") as f:
+    pin = re.search(r'ROOT_SHA = "([0-9a-f]{64})"', f.read()).group(1)
+boot = os.path.join(APP_DIR, "assets", "bootstrap.tar.gz")
+need = {"bin/oneios_root.sh", "oneios_switch.sh", "oneios_return.sh", "stage_ios16.sh",
+        "runtime.conf", "runtime.sha256", "runtime/runtime.json"}
+with tarfile.open(boot, "r:gz") as t:
+    names = set(m.name.lstrip("./") for m in t.getmembers())
+    missing = need - names
+    if missing:
+        print("BOOTSTRAP ERROR: missing", sorted(missing))
+        exit(1)
+    root_sha = hashlib.sha256(t.extractfile("bin/oneios_root.sh").read()).hexdigest()
+    if root_sha != pin:
+        print(f"BOOTSTRAP ERROR: bin/oneios_root.sh is {root_sha}, Manager.java pins {pin}")
+        exit(1)
+    for m in t.getmembers():
+        if m.isfile() and m.name.endswith(".sh"):
+            head = t.extractfile(m).read(3)
+            if head.startswith(b"\xef\xbb\xbf") or not head.startswith(b"#!"):
+                print(f"BOOTSTRAP ERROR: {m.name} does not start with '#!' (UTF-8 BOM?)")
+                exit(1)
+            if b"\r" in t.extractfile(m).read():
+                print(f"BOOTSTRAP ERROR: {m.name} has CRLF line endings")
+                exit(1)
+print("Bootstrap OK (oneios_root.sh matches the pin, scripts are plain LF).")
+
+print("[1] Compiling Manager.java with javac...")
+cmd_javac = ["javac", "-encoding", "UTF-8", "-cp", SDK_JAR, "-d", CLASSES_DIR, java_src]
 res = subprocess.run(cmd_javac, capture_output=True, text=True)
 if res.returncode != 0:
     print("JAVAC ERROR:\n", res.stderr)
@@ -53,7 +83,8 @@ print("[3] Packaging with AAPT (including resources & icon)...")
 unsigned_apk = os.path.join(APP_DIR, "build", "manager-unsigned.apk")
 if os.path.exists(unsigned_apk):
     os.remove(unsigned_apk)
-cmd_aapt = [AAPT, "package", "-f", "-M", MANIFEST, "-S", RES_DIR, "-I", SDK_JAR, "-F", unsigned_apk]
+ASSETS_DIR = os.path.join(APP_DIR, "assets")
+cmd_aapt = [AAPT, "package", "-f", "-M", MANIFEST, "-S", RES_DIR, "-A", ASSETS_DIR, "-I", SDK_JAR, "-F", unsigned_apk]
 res = subprocess.run(cmd_aapt, capture_output=True, text=True)
 if res.returncode != 0:
     print("AAPT ERROR:\n", res.stderr)

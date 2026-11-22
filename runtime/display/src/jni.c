@@ -12,6 +12,16 @@
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <time.h>
+
+// Timing of the post loop, one line every 2 s while frames flow (the A56's iOS 16.5 felt seconds behind the finger
+// and stuttered although the guest swapped every 12-17 ms): frames posted, and the mean and worst lock, copy and post.
+static uint64_t now_us(void)
+{
+  struct timespec t;
+  clock_gettime(CLOCK_MONOTONIC, &t);
+  return (uint64_t)t.tv_sec * 1000000u + (uint64_t)t.tv_nsec / 1000u;
+}
 #include <string.h>
 #include <unistd.h>
 
@@ -131,6 +141,8 @@ JNIEXPORT jint JNICALL Java_OneiOSDisplay_nRun(JNIEnv *env, jclass type, jlong h
   struct xhd_rect pending = { 0, 0, f->width, f->height };
   unsigned long frames = 0;
   int result;
+  uint64_t t_window = now_us(), t_lock = 0, t_copy = 0, t_post = 0, w_lock = 0, w_copy = 0, w_post = 0;
+  unsigned long n_window = 0;
   for (;;) {
     struct pollfd fds[2] = { { c->fd, POLLIN, 0 }, { signal_pipe[0], POLLIN, 0 } };
     int ready = poll(fds, 2, pending.w ? 0 : -1);
@@ -143,7 +155,9 @@ JNIEXPORT jint JNICALL Java_OneiOSDisplay_nRun(JNIEnv *env, jclass type, jlong h
     ARect dirty = { (int32_t)pending.x, (int32_t)pending.y, (int32_t)(pending.x + pending.w), (int32_t)(pending.y + pending.h) };
     if (frames < 4) dirty = (ARect){ 0, 0, (int32_t)f->width, (int32_t)f->height };
     ANativeWindow_Buffer buffer;
+    uint64_t t0 = now_us();
     int error = ANativeWindow_lock(window, &buffer, &dirty);
+    uint64_t t1 = now_us();
     if (error) {
       if (frames == 0 && format != FORMAT_RGBX_8888) {
         // No B,G,R,A buffers here: R,G,B,X and a swap. No RGBA_FP16 ones: B,G,R,A, the half floats encoded to sRGB
@@ -172,7 +186,20 @@ JNIEXPORT jint JNICALL Java_OneiOSDisplay_nRun(JNIEnv *env, jclass type, jlong h
       if (buffer.width > 0 && buffer.height > 0 && buffer.stride >= buffer.width && xhd_rect_clip(&r, width, height))
         xhd_copy(buffer.bits, (size_t)buffer.stride * bytes, layout, f->pixels, f->stride, f->format, r);
     }
+    uint64_t t2 = now_us();
     ANativeWindow_unlockAndPost(window);
+    uint64_t t3 = now_us();
+    t_lock += t1 - t0; t_copy += t2 - t1; t_post += t3 - t2; n_window++;
+    if (t1 - t0 > w_lock) w_lock = t1 - t0;
+    if (t2 - t1 > w_copy) w_copy = t2 - t1;
+    if (t3 - t2 > w_post) w_post = t3 - t2;
+    if (t3 - t_window >= 2000000u) {
+      fprintf(stderr, "oneios-display: timing: %lu frames in %llu ms; lock %llu/%llu us, copy %llu/%llu us, post %llu/%llu us (mean/worst)\n",
+              n_window, (unsigned long long)((t3 - t_window) / 1000u),
+              (unsigned long long)(t_lock / n_window), (unsigned long long)w_lock, (unsigned long long)(t_copy / n_window),
+              (unsigned long long)w_copy, (unsigned long long)(t_post / n_window), (unsigned long long)w_post);
+      t_window = t3; t_lock = t_copy = t_post = w_lock = w_copy = w_post = 0; n_window = 0;
+    }
     if (frames++ == 0)
       fprintf(stderr, "oneios-display: first frame posted (%dx%d buffer, stride %d, format %d %s, dataspace %#x %s; the guest's frame: %s)\n",
               buffer.width, buffer.height, buffer.stride, buffer.format, format_name(buffer.format), (unsigned)ANativeWindow_getBuffersDataSpace(window),

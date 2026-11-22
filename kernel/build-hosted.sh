@@ -117,6 +117,31 @@ if 'CONFIG_XNU_NATIVE_LEGACY_DISPLAY' in text:
     raise SystemExit('build-hosted: the hosted defconfig already sets CONFIG_XNU_NATIVE_LEGACY_DISPLAY')
 open(config, 'w').write(text.rstrip('\n') + '\nCONFIG_XNU_NATIVE_LEGACY_DISPLAY=y\n')
 PY
+# ONEIOS_CRYPTO=original: a kernel with none of the source corecrypto in it. The source-mode bootstrap
+# (prng_random.c, UniXNU's) already starts the kernel collection's own com.apple.kec.corecrypto early; its fallback,
+# the source provider's corecrypto_kext_start, is the kernel's one reference into the source corecrypto archive
+# (Apple's Internal Use License). kernel/patches/oneios-hosted/optional/original-corecrypto-only.patch replaces that
+# fallback with a panic, so the linker takes nothing of the archive, and there is no source POST to seal. The patch
+# is added last to this build's hosted series (written into the device copy, with absolute paths); the committed
+# series is not touched. (UniXNU's XNU_CRYPTO_BOOTSTRAP="prelinked" does not link here: xnu-12377's OSKext::start
+# calls the source-mode entry.) Default: source, the qualified path.
+CRYPTO=${ONEIOS_CRYPTO:-source}
+case "$CRYPTO" in
+  source) ;;
+  original)
+    SERIES_IN=$(grep -o '"[^"]*oneios-hosted[^"]*series[^"]*"' "$DEVICE/board.toml" | tail -1 | tr -d '"')
+    [ -f "$SERIES_IN" ] || { echo "build-hosted: the hosted series in board.toml ($SERIES_IN) is not a file" >&2; exit 1; }
+    SERIES_OUT=$DEVICE/hosted-series-original-crypto
+    SDIR=$(cd "$(dirname "$SERIES_IN")" && pwd)
+    sed -e '/^[[:space:]]*#/b' -e '/^[[:space:]]*$/b' -e "s#^#$SDIR/#" "$SERIES_IN" > "$SERIES_OUT"
+    echo "$ROOT/kernel/patches/oneios-hosted/optional/original-corecrypto-only.patch" >> "$SERIES_OUT"
+    sed_i "s#\"$SERIES_IN\"#\"$SERIES_OUT\"#" "$DEVICE/board.toml"
+    grep -q "\"$SERIES_OUT\"" "$DEVICE/board.toml" || { echo "build-hosted: could not point board.toml at $SERIES_OUT" >&2; exit 1; }
+    # UniXNU's kernel step seals the source POST after the link; there is none (kernel/patches/unixnu/0003).
+    export ONEIOS_SKIP_SOURCE_SEAL=1
+    echo "build-hosted: original corecrypto only (the kernel collection's; no source corecrypto linked)" ;;
+  *) echo "build-hosted: ONEIOS_CRYPTO is source or original, not '$CRYPTO'" >&2; exit 1 ;;
+esac
 mkdir -p "$UNIXNU_OUT_DIR"
 [ -e "$UNIXNU_OUT_DIR/feeds" ] || [ ! -d "$ROOT/out/kernel/unixnu/feeds" ] || ln -s "$ROOT/out/kernel/unixnu/feeds" "$UNIXNU_OUT_DIR/feeds"
 
@@ -149,7 +174,7 @@ fi
 # sites in their boot state) in mach.development.bcm2837.unstripped only. UniXNU's driver stages the .noctf file,
 # whose HMAC field is empty: corecrypto's integrity self-test fails on it (-2074).
 SEALED=$WORK/tree/build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/mach.development.bcm2837.unstripped
-[ -f "$SEALED.crypto-hmac.json" ] || { echo "build-hosted: $SEALED was not sealed" >&2; exit 1; }
+[ "$CRYPTO" = original ] || [ -f "$SEALED.crypto-hmac.json" ] || { echo "build-hosted: $SEALED was not sealed" >&2; exit 1; }
 mkdir -p "$ROOT/out/kernel/current-hosted$SUFFIX"
 cp "$SEALED" "$ROOT/out/kernel/current-hosted$SUFFIX/xnu.macho"
 # Post-link text fixes of the hosted layer (`oneios-tool kernel hosted-fixup`, kernel/hosted-fixup.py until 2026-11-13: a
@@ -158,7 +183,21 @@ cp "$SEALED" "$ROOT/out/kernel/current-hosted$SUFFIX/xnu.macho"
 # an already sealed kernel).
 SEALED=$ROOT/out/kernel/current-hosted$SUFFIX/xnu.macho
 "$ONEIOS_TOOL" kernel hosted-fixup "$SEALED"
-( cd "$WORK/tree" && UNIXNU_XNU_ARCH=arm64e python3 scripts/seal-source-crypto-kernel.py "$SEALED" )
+if [ "$CRYPTO" = original ]; then
+  # No source POST to seal; and the kernel must hold no symbol of the source corecrypto archive.
+  CC_ARCHIVE=$WORK/tree/build/corecrypto-2023/libcorecrypto_kernel_noasm-namespaced.a
+  NM=$(command -v llvm-nm || true)
+  if [ -n "$NM" ] && [ -f "$CC_ARCHIVE" ]; then
+    CC_IN=$(comm -12 <("$NM" -g --defined-only "$CC_ARCHIVE" 2>/dev/null | awk 'NF==3{print $3}' | sort -u) \
+                     <("$NM" -g "$SEALED" 2>/dev/null | awk '{print $NF}' | sort -u) | wc -l)
+    [ "$CC_IN" = 0 ] || { echo "build-hosted: the original-corecrypto kernel holds $CC_IN symbols of the source corecrypto" >&2; exit 1; }
+    echo "build-hosted: no symbol of the source corecrypto archive in the kernel"
+  else
+    echo "build-hosted: llvm-nm or the corecrypto archive missing: the no-corecrypto check was not run" >&2
+  fi
+else
+  ( cd "$WORK/tree" && UNIXNU_XNU_ARCH=arm64e python3 scripts/seal-source-crypto-kernel.py "$SEALED" )
+fi
 # XNU_FILESET_REFERENCE=1: the RELEASE reference of the prelink (kernel/prelink/build.sh REFERENCE=), next to the kernel.
 REF=$WORK/tree/build/xnu/fileset-reference/mach.release.bcm2837.unstripped.noctf
 if [ "${XNU_FILESET_REFERENCE:-0}" = 1 ]; then

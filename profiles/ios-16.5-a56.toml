@@ -34,6 +34,9 @@ display_scale = 3
 touch_device = "/dev/input/event4"
 
 [display]
+# The guest frame: the panel's 1080x2340 @3x, 360x780 points, a width no iPhone has, so 20F66's UIKit shows
+# "Please see rdar://45025538" (no status bar visual provider). iPhone X's 1125x2436 (375x812 points) removes that
+# but SpringBoard then aborted in a loop on the phone (2026-11-18, open). oneios_switch_a56.sh --inner, ONEIOS_FRAME.
 width = 1080
 height = 2340
 refresh_hz = 120

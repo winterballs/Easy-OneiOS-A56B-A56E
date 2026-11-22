@@ -101,4 +101,34 @@ void bt_parcel_send(hb_parcel *p, unsigned code, const uint8_t *packet, size_t l
 // reply parcel is a normal one, else the status code to reply with (HB_UNKNOWN_TRANSACTION).
 int bt_callback_transact(uint32_t code, hb_reader *r, hb_parcel *reply, uint8_t *type, const uint8_t **packet, size_t *length, int32_t *status);
 
+// ---- AIDL (android.hardware.bluetooth.IBluetoothHci, /dev/binder) ------------------------------
+// Phones whose Bluetooth HAL is the stable AIDL one (the Galaxy A56: android.hardware.bluetooth-service.default,
+// Android 16) register it with servicemanager, not hwservicemanager. libbinder's Parcel layout: an interface token
+// is int32 strict-mode policy, int32 work source, int32 partition header ('VNDR' for a vendor process, 'SYST' for a
+// system one), then a String16; a strong binder is a flat object followed by an int32 stability level; byte[] is
+// an int32 length and the bytes padded to 4.
+#define AIDL_SM           "android.os.IServiceManager"
+#define AIDL_HCI          "android.hardware.bluetooth.IBluetoothHci"
+#define AIDL_HCI_NAME     "android.hardware.bluetooth.IBluetoothHci/default"
+#define AIDL_CALLBACKS    "android.hardware.bluetooth.IBluetoothHciCallbacks"
+#define AIDL_HDR_SYST     0x53595354u    // 'SYST'
+#define AIDL_HDR_VNDR     0x564e4452u    // 'VNDR'
+#define AIDL_STABILITY_VINTF 0x3f
+enum { AIDL_INTERFACE = 0x5f4e5446, AIDL_PING = 0x5f504e47, AIDL_VERSION = 0x00fffffe, AIDL_HASH = 0x00fffffd };
+// IBluetoothHci (declaration order) and IBluetoothHciCallbacks.
+enum { AIDL_CLOSE = 1, AIDL_INITIALIZE = 2, AIDL_SEND_ACL = 3, AIDL_SEND_COMMAND = 4, AIDL_SEND_ISO = 5, AIDL_SEND_SCO = 6 };
+enum { AIDL_CB_ACL = 1, AIDL_CB_EVENT = 2, AIDL_CB_INIT_COMPLETE = 3, AIDL_CB_ISO = 4, AIDL_CB_SCO = 5 };
+
+void aidl_put_token(hb_parcel *p, const char *interface, uint32_t header);
+void aidl_put_string16(hb_parcel *p, const char *text);      // ASCII
+void aidl_put_bytes(hb_parcel *p, const uint8_t *bytes, size_t length);
+void aidl_put_binder(hb_parcel *p, uint64_t pointer, uint64_t cookie);
+bool aidl_get_token(hb_reader *r);                            // skips it; false (and bad) when malformed
+bool aidl_get_bytes(hb_reader *r, const uint8_t **bytes, size_t *length);
+void aidl_parcel_get_service(hb_parcel *p);
+void aidl_parcel_initialize(hb_parcel *p, uint32_t header, uint64_t callback_pointer);
+void aidl_parcel_send(hb_parcel *p, uint32_t header, const uint8_t *packet, size_t length);
+// As bt_callback_transact, for IBluetoothHciCallbacks.
+int aidl_callback_transact(uint32_t code, hb_reader *r, hb_parcel *reply, uint8_t *type, const uint8_t **packet, size_t *length, int32_t *status);
+
 #endif

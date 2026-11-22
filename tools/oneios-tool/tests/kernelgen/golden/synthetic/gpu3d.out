@@ -1,3 +1,66 @@
+    ContextMsm = 1, ContextAmdgpu = 2, AmdgpuQueryInfo = 1, AmdgpuInfoAccelWorking = 0,
+    CcmdIoctlSimple =
+// next selftest anchor
+// AMDGPU_CCMD_QUERY_INFO contains the 32-byte drm_amdgpu_info UAPI structure.
+struct AmdgpuQuery {
+    uint32_t command, length, seqno, responseOffset;
+    uint64_t returnPointer;
+    uint32_t returnSize, query, arguments[4];
+};
+static_assert(sizeof(AmdgpuQuery) == 48, "AMDGPU query wire size");
+void stage(uint64_t
+// next selftest anchor
+    const bool amd = caps.contextType == ContextAmdgpu;
+    if (!amd && caps.contextType != ContextMsm) {
+        stage(3, kIOReturnUnsupported);
+        return;
+    }
+    uint64_t poolBase =
+// next selftest anchor
+        uint8_t request[sizeof(AmdgpuQuery)] = {};
+        const uint32_t requestSize = amd ? sizeof(AmdgpuQuery) : 20 + sizeof(DrmMsmParam);
+        const uint32_t responseSize = amd ? 12 : 8 + sizeof(DrmMsmParam);
+// next selftest anchor
+requestSize, 1, 0}, ioctl
+// next selftest anchor
+        if (amd) {
+            const AmdgpuQuery query = {AmdgpuQueryInfo, requestSize, 1, 0, 0,
+                                       sizeof(uint32_t), AmdgpuInfoAccelWorking, {}};
+            memcpy(request, &query, sizeof query);
+        } else {
+            memcpy(request, header, sizeof header);
+            memcpy(request + 16, &ioctl, 4);
+            memcpy(request + 20, &param, sizeof param);
+        }
+// next selftest anchor
+        const uint32_t responseOffset = shmem->responseOffset;
+        const bool validOffset = responseOffset >= sizeof(Shmem) && !(responseOffset & 3) &&
+                                 responseOffset <= ShmemBytes - responseSize;
+        volatile uint8_t *response = validOffset ? reinterpret_cast<volatile uint8_t *>(shmem) + responseOffset : nullptr;
+        Submit submit = {{CmdSubmit3D, 0, 0, context, 0, {}}, requestSize, 0};
+        uint32_t ticket = 0;
+        status = kIOReturnBadArgument;
+        if (response) {
+            // vdrm_alloc_rsp writes the space available to the host before submission.
+            *reinterpret_cast<volatile uint32_t *>(response) = responseSize;
+            status = post(&submit, sizeof submit, request, requestSize, sizeof reply, false, &ticket);
+        }
+// next selftest anchor
+            uint32_t words[8] = {};
+            for (unsigned i = 0; i < responseSize / 4; ++i)
+                words[i] = reinterpret_cast<const volatile uint32_t *>(response)[i];
+            const int32_t ret = int32_t(words[1]);
+            uint64_t value = 0;
+            if (words[0] == responseSize) {
+                if (amd) value = words[2];
+                else memcpy(&value, words + 4, sizeof value);
+            }
+            droidvm_virtgpu_selftest[5] = uint32_t(ret); droidvm_virtgpu_selftest[6] = value;
+            droidvm_virtgpu_selftest[8] = shmem->seqno; droidvm_virtgpu_selftest[9] = responseOffset;
+            memcpy(const_cast<uint64_t *>(&droidvm_virtgpu_selftest[10]), words, sizeof words);
+            stage(9, !ret && words[0] == responseSize && value ? 0 : kIOReturnIOError);
+            IOLog("virtgpu-selftest: %s ret %d value %llu response %u seqno %u\n",
+                  amd ? "AMDGPU ACCEL_WORKING" : "MSM GPU_ID", ret, value, words[0], shmem->seqno);
 // A made-up source for the edit list "gpu3d" (no Python original: written by hand, 2026-11-13): every anchor once.
 // (before anchor 0)
 DroidVMClientMemory droidvm_virtgpu_client_memory[64];

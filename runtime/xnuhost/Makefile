@@ -17,7 +17,7 @@ ARM64_RUN := $(if $(ARM64_NATIVE),,$(QEMU))
 WARN := -Wall -Wextra -Werror
 INC := -Iinclude -Isrc -Istub -I../loader/include -I../bridges/include -I../../drivers/bridge -I../../drivers/camera
 CFLAGS ?= -O2 -g
-SRC := main return log perf config insn mem discard ramfix usb mmio gic sysreg uart blk imageset virtio virtio_blk virtio_input virtio_gpu gpu3d display input input_script cpu hostcalls task
+SRC := main return log perf config insn mem discard ramfix usb mmio gic sysreg uart blk imageset virtio virtio_blk virtio_input virtio_gpu gpu3d gpu3d_xclipse gpu_pool display input input_script cpu hostcalls task
 PORTABLE := return log perf config insn discard ramfix usb mmio gic sysreg uart blk imageset virtio virtio_blk virtio_input input input_script virtio_gpu gpu3d cpu task
 LOADER_SRC := $(wildcard ../loader/src/*.c)
 HDR := $(wildcard include/xnuhost/*.h src/*.h stub/*.h ../loader/include/xnuloader/*.h)
@@ -42,6 +42,13 @@ VIRGL_INC := -imacros drm2kgsl/config.h -DHAVE_CONFIG_H=1 -D_GNU_SOURCE -Idrm2kg
 ifneq ($(wildcard $(VIRGL)/src/drm/drm2kgsl/drm2kgsl_renderer.c),)
 GPU3D := $(A)/gpu3d_kgsl.o $(A)/libdrm2kgsl.a
 GPU3D_DEF := -DXH_DRM2KGSL=1
+# Optional Android archive containing the patched AMD renderer and its libdrm dependencies.
+# Its virgl headers and common DRM objects must use the same response-pool patch.
+ifneq ($(strip $(AMDGPU_RENDERER_LIBS)),)
+VIRGL_INC += -DENABLE_DRM_AMDGPU=1 $(AMDGPU_RENDERER_CPPFLAGS)
+$(A)/gpu3d_kgsl.o: CFLAGS += -DXH_AMDGPU=1
+GPU3D += $(AMDGPU_RENDERER_LIBS) $(A)/gpu_pool.o $(A)/libdrm2kgsl.a
+endif
 DRM2KGSL_OBJ := $(patsubst %.c,$(A)/drm2kgsl/%.o,$(notdir $(DRM2KGSL_SRC)))
 vpath %.c $(sort $(dir $(addprefix $(VIRGL)/,$(DRM2KGSL_SRC))))
 $(A)/drm2kgsl/%.o: %.c drm2kgsl/config.h
@@ -65,16 +72,16 @@ endif
 $(A)/gpu3d.o: CFLAGS += $(GPU3D_DEF)
 # gpu3d.o holds the 2D-only stub of xh_gpu3d_kgsl_open unless XH_DRM2KGSL is set: it must be rebuilt when the
 # virglrenderer checkout appears or goes, or a stale stub and gpu3d_kgsl.o both define it (release 0.1.2's first run).
-GPU3D_MODE := $(if $(GPU3D_DEF),drm2kgsl,2d)
+GPU3D_MODE := $(if $(GPU3D_DEF),drm2kgsl,2d) $(AMDGPU_RENDERER_LIBS)
 $(A)/gpu3d.mode: FORCE
 	@mkdir -p $(A); echo '$(GPU3D_MODE)' | cmp -s - $@ || echo '$(GPU3D_MODE)' > $@
-$(A)/gpu3d.o: $(A)/gpu3d.mode
+$(A)/gpu3d.o $(A)/gpu3d_kgsl.o: $(A)/gpu3d.mode
 # gpuctl: the renderer alone, for a check on the phone (tools/gpuctl.c).
 $(A)/gpuctl: tools/gpuctl.c $(A)/gpu3d.o $(GPU3D) src/gpu3d.h
 	$(ANDROID_CC) -std=gnu11 $(CFLAGS) $(WARN) -Wno-unused-parameter -Isrc -static -o $@ tools/gpuctl.c $(A)/gpu3d.o $(GPU3D) -lm
 
 # The renderer with the patched drm2kgsl on the build host, against a stand-in for KGSL's memory ioctls (tests/test_drm2kgsl.c).
-ifneq ($(GPU3D),)
+ifneq ($(GPU3D_DEF),)
 # drm2kgsl/host_c11.h: mesa's C11 threads shim beside a new glibc
 HOST_C11 := -include drm2kgsl/host_c11.h
 $(H)/test_drm2kgsl: tests/test_drm2kgsl.c src/gpu3d.c src/gpu3d_kgsl.c src/gpu3d.h drm2kgsl/oneios_drm2kgsl.h $(A)/drm2kgsl/patched/drm2kgsl_renderer.c
@@ -124,7 +131,7 @@ CAMERA := ../bridges/camera/build/android/libonecamera.a
 $(CAMERA): FORCE
 	$(MAKE) -s -C ../bridges/camera NDK=$(NDK) build/android/libonecamera.a
 FORCE:
-$(A)/xnuhost: $(SRC:%=$(A)/%.o) $(A)/kctx.o $(A)/arch.o $(patsubst ../loader/src/%.c,$(A)/loader_%.o,$(LOADER_SRC)) $(CAMERA) $(BRIDGES) $(GPU3D)
+$(A)/xnuhost: $(filter-out $(GPU3D),$(SRC:%=$(A)/%.o)) $(A)/kctx.o $(A)/arch.o $(patsubst ../loader/src/%.c,$(A)/loader_%.o,$(LOADER_SRC)) $(CAMERA) $(BRIDGES) $(GPU3D)
 	$(ANDROID_CC) -static -o $@ $^ -lm
 
 # ---- host unit tests ----

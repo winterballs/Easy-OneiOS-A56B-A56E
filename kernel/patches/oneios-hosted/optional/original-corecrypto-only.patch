@@ -1,0 +1,26 @@
+diff --git a/osfmk/prng/prng_random.c b/osfmk/prng/prng_random.c
+--- a/osfmk/prng/prng_random.c
++++ b/osfmk/prng/prng_random.c
+@@ -625,11 +625,22 @@
+ 		}
+ 		return;
+ 	}
++#if XNU_HOSTED
++	/*
++	 * OneiOS hosted, original corecrypto only (kernel/build-hosted.sh ONEIOS_CRYPTO=original): the kernel
++	 * collection's own com.apple.kec.corecrypto is the provider, started above. The source provider is not a
++	 * fallback: this call was the kernel's one reference into the source corecrypto archive, so without it the
++	 * linker takes none of that archive (Apple's Internal Use License) into the kernel.
++	 */
++	(void)info;
++	panic("original corecrypto: com.apple.kec.corecrypto is not in the kernel collection");
++#else
+ 	info.address = (vm_address_t)&_mh_execute_header;
+ 	source_corecrypto14_status = corecrypto_kext_start(&info, NULL);
+ 	if (source_corecrypto14_status != KERN_SUCCESS) {
+ 		panic("source corecrypto initialization failed: %d", source_corecrypto14_status);
+ 	}
++#endif
+ }
+ /* PE_init_iokit hashes the platform UUID through the crypto KPIs before EARLY_BOOT runs. */
+ STARTUP(SYSCTL, STARTUP_RANK_LAST, source_corecrypto14_bootstrap);

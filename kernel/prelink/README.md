@@ -74,6 +74,12 @@ Before step 2, `prelink merge-reviewed` merges the other agents' reviewed record
 `prelink port-fixture` (then `port-fixture.py`) carried 50 of XnuPrelink's reviewed iPad identities over (functions with the same bytes here);
 rerun it only when that fixture changes. `prelink unmapped` names the original function behind a stub panic.
 
+`prelink emit` fills the kernel's source-corecrypto POST field (`__fips_hmacs`) after it moves the kernel's text. A
+kernel built with `ONEIOS_CRYPTO=original` has no such field: since 2026-11-18 the emitter then seals nothing and the
+report says `"corecrypto_hmac_sha256": "none: no source corecrypto in the kernel"` (a OneiOS change to the port, not in
+XnuPrelink). With one field it does exactly what it did before. Such a kernel's collection is
+`OUT=out/kernel/24A446-nocc` in docs/building.md section 2.
+
 ## Which kexts (`prelink roots`)
 
 Every kext of the collection is a root, except one all of whose IOKit personalities attach to hardware xnuhost

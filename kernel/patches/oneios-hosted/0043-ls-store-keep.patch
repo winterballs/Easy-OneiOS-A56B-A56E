@@ -1,7 +1,7 @@
 diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
 --- a/bsd/kern/kern_exec.c
 +++ b/bsd/kern/kern_exec.c
-@@ -8751,7 +8751,111 @@
+@@ -8751,7 +8751,120 @@
  	    error ? "not made" : "made", error);
  }
  #endif /* XNU_HOSTED */
@@ -33,6 +33,15 @@ diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
 +	for (unsigned i = 0; i < found; i++) {
 +		size_t length = strlen(apps->name[i]);
 +		if (length > 4 && !strcmp(apps->name[i] + length - 4, ".app")) {
++			/* A bundle without its own Info.plist (a macOS bundle such as 20F66's DisplayCal.app, Contents/Info.plist) is
++			 * never registered by lsd: counting it, no database ever named every app and each boot dropped it (A56). */
++			char plist[96];
++			vnode_t plist_vp = NULLVP;
++			snprintf(plist, sizeof(plist), "/Applications/%s/Info.plist", apps->name[i]);
++			if (vnode_lookup(plist, 0, &plist_vp, vfs_context_current()) != 0) {
++				continue;
++			}
++			vnode_put(plist_vp);
 +			if (apps->count != i) {
 +				memcpy(apps->name[apps->count], apps->name[i], length + 1);
 +			}
@@ -113,7 +122,7 @@ diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
  native_ls_store_drop(proc_t p, user_addr_t scratch)
  {
  	/* LaunchServices keeps its database in the Library/Caches of lsd's data container, whose name is a UUID made when the Data store
-@@ -8790,6 +8894,47 @@
+@@ -8790,6 +8903,47 @@
  				continue;
  			}
  			looked++;

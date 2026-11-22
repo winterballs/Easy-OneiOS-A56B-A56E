@@ -1,0 +1,214 @@
+diff --git a/iokit/Kernel/IOUserClient.cpp b/iokit/Kernel/IOUserClient.cpp
+--- a/iokit/Kernel/IOUserClient.cpp
++++ b/iokit/Kernel/IOUserClient.cpp
+@@ -5786,6 +5786,137 @@
+ 	return ret;
+ }
+ 
++#if XNU_HOSTED
++/*
++ * OneiOS hosted (0072): iOS 16.5 (20F66) user space on this collection's iOS 27 (24A446) IOMobileGraphicsFamily
++ * and IOSurface. Their external methods kept their numbers, but some structures grew, and the dispatch tables check
++ * sizes exactly, so 20F66's calls were refused (kIOReturnBadArgument) and the A56's panel stayed black. The calls
++ * are rewritten here, in is_io_connect_method, to 24A446's shape, and the answers back to 20F66's:
++ *
++ * - IOMobileFramebufferUserClient 5 (swap_submit): 20F66 submits a 0x46c-byte record, 24A446 wants 0x6e0. From the
++ *   swap ID on both hold the same fields, 24A446's 0x48 bytes further in (swap ID 0x50 -> 0x98, surface IDs 0x54 ->
++ *   0x9c, source rectangles 0x64 -> 0xac, destination rectangles 0xc4 -> 0x10c, layer masks 0x104/0x108 ->
++ *   0x14c/0x150, transforms 0x114 -> 0x15c, dirty regions up to 0x250 -> 0x298; 20F66's SwapBegin, SwapSetLayer and
++ *   SwapDirtyRegion, 24A446's swap_submit). That range is copied, the rest (timestamps, fields 24A446 added) is 0.
++ * - IOMobileFramebufferUserClient 74 (SupportedFrameInfo): 20F66 asks for 1 scalar out, 24A446 gives 2; the first
++ *   is returned.
++ * - IOSurfaceRootUserClient 0, 2, 4, 6, 7, 34 (create and lookups): the surface info. 20F66 takes 0xa68 bytes, a
++ *   0x68-byte header and 20 planes of 0x80 (IOSurface.framework's client constructor and accessors); 24A446 writes
++ *   0xc68, a 0x88-byte header and 20 planes of 0x98, with sizes, bytes per row and offsets widened to 64 bits (both
++ *   kernels' fill functions, 20F66 0xfffffff005a57648 and 24A446 0xfffffe000a33ca30, and both kernels' property
++ *   parsers for the field names). hosted_ios16_info_27_to_16 rewrites 24A446's answer into 20F66's layout.
++ * - Not rewritten (not on the compositor's path): IOSurfaceRootUserClient 27/28 (bulk attachments, 0x88 vs 0xa0),
++ *   36 (accelerator, scalars in 0 vs 1), 38 (accelerator, scalars out 3 vs 4).
++ * - IOSurfaceRootUserClient 13 (the root's limits, the framework's first call; it closes the root on a failure):
++ *   20F66 takes 0x18 bytes, 24A446 writes 0x28. Alignments and maxima (0x0..0x14) are returned as they are, the flag
++ *   at 0x20 goes to 0x14, the version at 0x22 to 0x16.
++ *
++ * One line at the first rewrite of each kind. Boot argument oneios-iomfb-swap16=0 turns all of it off.
++ */
++#define HOSTED_IOMFB_SWAP16_SIZE 0x46c
++#define HOSTED_IOMFB_SWAP27_SIZE 0x6e0
++#define HOSTED_IOMFB_SWAP16_FROM 0x50
++#define HOSTED_IOMFB_SWAP27_FROM 0x98
++#define HOSTED_IOMFB_SWAP_COPIED 0x200
++#define HOSTED_IOSURFACE16_LIMITS 0x18
++#define HOSTED_IOSURFACE27_LIMITS 0x28
++#define HOSTED_IOSURFACE16_INFO 0xa68
++#define HOSTED_IOSURFACE27_INFO 0xc68
++static inline uint64_t
++hosted_rd64(const uint8_t *p)
++{
++	uint64_t v;
++	memcpy(&v, p, sizeof(v));
++	return v;
++}
++static inline void
++hosted_wr32(uint8_t *p, uint64_t v)
++{
++	uint32_t w = (uint32_t)v;
++	memcpy(p, &w, sizeof(w));
++}
++/*
++ * 24A446's surface info (s, 0xc68 bytes) into 20F66's (d, 0xa68 bytes).
++ * Header, 24A446 -> 20F66: 0x00..0x1c the same (from the user client: the shared page, the timestamp, the ID);
++ * alloc size 0x20 (u64) -> 0x1c and 0x34 (u32); width 0x28 -> 0x20, height 0x30 -> 0x24, bytes per row 0x38 -> 0x28,
++ * offset 0x40 -> 0x2c (u64 -> u32); pixel format 0x48 -> 0x30; 0x58..0x88 -> 0x38..0x68 (plane count, bytes per
++ * element and element size, cache mode, subsampling, use counts, parent ID, slice count, trace ID, protection).
++ * Each plane, 24A446 0x88 + p * 0x98 -> 20F66 0x68 + p * 0x80: width, height, (unnamed), offset, bytes per row and
++ * size at 0x00..0x30 (u64) -> 0x00..0x18 (u32); bytes per element and element size 0x30 -> 0x18 (4 bytes); the
++ * component count, flag and component tables 0x34 -> 0x1c (0x18 bytes); compression 0x4c -> 0x34 (0x3c bytes);
++ * 0x88 -> 0x70 (0x10 bytes).
++ */
++static void
++hosted_ios16_info_27_to_16(const uint8_t *s, uint8_t *d)
++{
++	bzero(d, HOSTED_IOSURFACE16_INFO);
++	memcpy(d, s, 0x1c);
++	hosted_wr32(d + 0x1c, hosted_rd64(s + 0x20));
++	hosted_wr32(d + 0x20, hosted_rd64(s + 0x28));
++	hosted_wr32(d + 0x24, hosted_rd64(s + 0x30));
++	hosted_wr32(d + 0x28, hosted_rd64(s + 0x38));
++	hosted_wr32(d + 0x2c, hosted_rd64(s + 0x40));
++	memcpy(d + 0x30, s + 0x48, 4);
++	hosted_wr32(d + 0x34, hosted_rd64(s + 0x20));
++	memcpy(d + 0x38, s + 0x58, 0x30);
++	for (unsigned p = 0; p < 20; p++) {
++		const uint8_t *ps = s + 0x88 + p * 0x98;
++		uint8_t *pd = d + 0x68 + p * 0x80;
++		for (unsigned k = 0; k < 6; k++) {
++			hosted_wr32(pd + 4 * k, hosted_rd64(ps + 8 * k));
++		}
++		memcpy(pd + 0x18, ps + 0x30, 4);
++		memcpy(pd + 0x1c, ps + 0x34, 0x18);
++		memcpy(pd + 0x34, ps + 0x4c, 0x3c);
++		memcpy(pd + 0x70, ps + 0x88, 0x10);
++	}
++}
++enum { HOSTED_IOS16_NONE, HOSTED_IOS16_IOMFB, HOSTED_IOS16_IOSURFACE };
++static int hosted_ios16_state = -1;
++static const OSMetaClass *hosted_ios16_iomfb_meta, *hosted_ios16_iosurface_meta;
++static uint32_t hosted_ios16_logged;
++static int
++hosted_ios16_kind(IOUserClient *client)
++{
++	if (hosted_ios16_state < 0) {
++		uint32_t on = 1;
++		PE_parse_boot_argn("oneios-iomfb-swap16", &on, sizeof(on));
++		hosted_ios16_state = on != 0;
++	}
++	if (hosted_ios16_state == 0 || client == NULL) {
++		return HOSTED_IOS16_NONE;
++	}
++	const OSMetaClass *meta = client->getMetaClass();
++	if (meta == NULL) {
++		return HOSTED_IOS16_NONE;
++	}
++	if (meta == hosted_ios16_iomfb_meta) {
++		return HOSTED_IOS16_IOMFB;
++	}
++	if (meta == hosted_ios16_iosurface_meta) {
++		return HOSTED_IOS16_IOSURFACE;
++	}
++	const char *name = meta->getClassName();
++	if (hosted_ios16_iomfb_meta == NULL && !strcmp(name, "IOMobileFramebufferUserClient")) {
++		hosted_ios16_iomfb_meta = meta;
++		return HOSTED_IOS16_IOMFB;
++	}
++	if (hosted_ios16_iosurface_meta == NULL && !strcmp(name, "IOSurfaceRootUserClient")) {
++		hosted_ios16_iosurface_meta = meta;
++		return HOSTED_IOS16_IOSURFACE;
++	}
++	return HOSTED_IOS16_NONE;
++}
++static void
++hosted_ios16_note(uint32_t bit, const char *what, uint32_t selector)
++{
++	if ((hosted_ios16_logged & bit) == 0) {
++		hosted_ios16_logged |= bit;
++		IOLog("oneios-iomfb: iOS 16 call rewritten for iOS 27: %s selector %u\n", what, selector);
++	}
++}
++#endif /* XNU_HOSTED */
++
+ /* Routine io_user_client_method */
+ kern_return_t
+ is_io_connect_method
+@@ -5865,6 +5996,43 @@
+ 	    ? ((typeof(args.structureOutputDescriptorSize)) * ool_output_size)
+ 	    : 0;
+ 
++#if XNU_HOSTED
++	uint8_t hosted_swap27[HOSTED_IOMFB_SWAP27_SIZE];
++	uint8_t hosted_limits27[HOSTED_IOSURFACE27_LIMITS];
++	uint8_t *hosted_info27 = NULL;
++	int hosted_out = 0;          /* 1: IOSurface info, 2: IOSurface limits, 3: SupportedFrameInfo scalars */
++	int hosted_kind = (inputMD == NULL && outputMD == NULL) ? hosted_ios16_kind(client) : HOSTED_IOS16_NONE;
++	if (hosted_kind == HOSTED_IOS16_IOMFB && selector == 5 && args.structureInput != NULL &&
++	    args.structureInputSize == HOSTED_IOMFB_SWAP16_SIZE) {
++		bzero(hosted_swap27, sizeof(hosted_swap27));
++		memcpy(hosted_swap27 + HOSTED_IOMFB_SWAP27_FROM, (const uint8_t *)args.structureInput + HOSTED_IOMFB_SWAP16_FROM,
++		    HOSTED_IOMFB_SWAP_COPIED);
++		args.structureInput = hosted_swap27;
++		args.structureInputSize = sizeof(hosted_swap27);
++		hosted_ios16_note(1, "IOMobileFramebufferUserClient swap record 0x46c -> 0x6e0,", selector);
++	} else if (hosted_kind == HOSTED_IOS16_IOMFB && selector == 74 && args.scalarOutputCount == 1) {
++		args.scalarOutputCount = 2;
++		hosted_out = 3;
++		hosted_ios16_note(2, "IOMobileFramebufferUserClient scalar out 1 -> 2,", selector);
++	} else if (hosted_kind == HOSTED_IOS16_IOSURFACE && args.structureOutputSize == HOSTED_IOSURFACE16_INFO &&
++	    (selector == 0 || selector == 2 || selector == 4 || selector == 6 || selector == 7 || selector == 34)) {
++		hosted_info27 = (uint8_t *)IOMallocData(HOSTED_IOSURFACE27_INFO);
++		if (hosted_info27 != NULL) {
++			bzero(hosted_info27, HOSTED_IOSURFACE27_INFO);
++			args.structureOutput = hosted_info27;
++			args.structureOutputSize = HOSTED_IOSURFACE27_INFO;
++			hosted_out = 1;
++			hosted_ios16_note(4, "IOSurfaceRootUserClient surface info 0xa68 <- 0xc68,", selector);
++		}
++	} else if (hosted_kind == HOSTED_IOS16_IOSURFACE && selector == 13 &&
++	    args.structureOutputSize == HOSTED_IOSURFACE16_LIMITS) {
++		bzero(hosted_limits27, sizeof(hosted_limits27));
++		args.structureOutput = hosted_limits27;
++		args.structureOutputSize = sizeof(hosted_limits27);
++		hosted_out = 2;
++		hosted_ios16_note(8, "IOSurfaceRootUserClient limits 0x18 <- 0x28,", selector);
++	}
++#endif
+ 	IOStatisticsClientCall();
+ 	ret = kIOReturnSuccess;
+ 	io_filter_policy_t filterPolicy = client->filterForTask(current_task(), 0);
+@@ -5878,6 +6046,28 @@
+ #endif
+ 	}
+ 
++#if XNU_HOSTED
++	if (hosted_out == 3) {
++		args.scalarOutputCount = 1;
++	} else if (hosted_out == 1) {
++		if (kIOReturnSuccess == ret) {
++			hosted_ios16_info_27_to_16(hosted_info27, (uint8_t *)inband_output);
++		}
++		args.structureOutput = inband_output;
++		args.structureOutputSize = (kIOReturnSuccess == ret) ? HOSTED_IOSURFACE16_INFO : 0;
++		IOFreeData(hosted_info27, HOSTED_IOSURFACE27_INFO);
++	} else if (hosted_out == 2) {
++		uint8_t *o = (uint8_t *)inband_output;
++		if (kIOReturnSuccess == ret) {
++			memcpy(o, hosted_limits27, 0x14);
++			o[0x14] = hosted_limits27[0x20];
++			o[0x15] = 0;
++			memcpy(o + 0x16, hosted_limits27 + 0x22, 2);
++		}
++		args.structureOutput = inband_output;
++		args.structureOutputSize = (kIOReturnSuccess == ret) ? HOSTED_IOSURFACE16_LIMITS : 0;
++	}
++#endif
+ 	*scalar_outputCnt = args.scalarOutputCount;
+ 	*inband_outputCnt = args.structureOutputSize;
+ 	*ool_output_size  = args.structureOutputDescriptorSize;

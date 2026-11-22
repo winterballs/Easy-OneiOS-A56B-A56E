@@ -59,24 +59,21 @@ To prevent energy-aware scheduler (EAS) throttling during trapped context switch
 - **4x Cortex-A520 @ 1.95 GHz** (Efficiency Cores)
 - Real-time priority (`-20` renice) assigned to the `xnuhost` thread group.
 
-#### 6. AGXAccelerator User Client Gate (Type 0x1) & Framebuffer Rendering Fix
-When booting with the Galaxy A56 unlocked, `backboardd` and `SpringBoard` initialized cleanly, but the display buffer remained 100% black (`0x00000000`). Analysis of the guest log revealed:
+#### 6. iOS 16.5 graphics status
+On the unlocked Galaxy A56, `backboardd` and `SpringBoard` started, but the guest display buffer remained black. The guest log recorded:
+
 ```text
 [ 11140.190] guest oneios-gpu-open: backboardd[46] AGXAccelerator type 0x1 -> 0xe00002c7
 ```
-`0xe00002c7` is `kIOReturnUnsupported`. The underlying GPU publishing driver (`NativeAdrenoPublish.cpp`) had a legacy gate refusing any connection where `type != NativeAdrenoPluginOpenType (0x4147)`. However, stock iOS 16.5 `backboardd` calls `IOServiceOpen` requesting client type `0x1` (`kIOContextDeviceClient`). Because this call was rejected, CoreAnimation was denied an accelerator context and aborted surface allocation.
 
-By updating the open gate to accept `((type & 0xff) == 1)` alongside `0x4147`:
-- `backboardd` claims **slot 0** (the dedicated high-performance ring buffer with active mailbox polling thread).
-- The driver injects the `NativeSandboxGrant` boolean property onto the client, bypassing Mandatory Access Control Framework (MACF) restrictions in userland.
-- `backboardd` immediately creates hardware-backed surfaces, routing native composited frames directly into the OneiOS display buffer and illuminating the AMOLED panel.
+The stock iOS graphics client uses the Apple IOGPU interface. The existing NativeAdreno client uses the OneiOS Metal plug-in protocol. iOS 16.5 sessions now start without the Metal accelerator (`oneios-gpu-metal=0`). The kernel's framebuffer and IOSurface drivers come from iOS 27, so a translation layer in the kernel (patch `0072`) rewrites iOS 16.5's calls to them. With it the A56 shows the Apple boot logo drawn by iOS 16.5; getting past the logo to SpringBoard is the next step.
 
 ---
 
 ### Frequently Asked Questions (FAQ)
 
 **Q: Can it have a Lock Screen?**  
-**A:** Yes! The authentic iOS lock screen is fully functional. `SpringBoard` and `PaperBoard` present the clock, date, notifications, and swipe-to-unlock gesture. The AMD GPU pipeline renders directly to the framebuffer at 1080x2340 @3x at 120Hz.
+**A:** The test build starts `SpringBoard`, but the iOS lock screen is still blocked by graphics compatibility.
 
 **Q: Does this trip Knox (0x1)?**  
 **A:** No. Knox is tripped only when an unsigned kernel is flashed to the physical flash partition (`/dev/block/by-name/boot`) or when the bootloader fuse is burned. OneiOS executes entirely in userland memory space on top of the stock One UI Linux kernel via KernelSU root. Your device remains Knox 0x0 (`warranty_bit: 0`, `verifiedbootstate: green`).
@@ -97,14 +94,14 @@ By updating the open gate to accept `((type & 0xff) == 1)` alongside `0x4147`:
    ```text
    📥   BAIXAR / IMPORTAR IMAGEM IOS 16.5
    ```
-   Select **📥 Baixar direto do GitHub Releases (iOS 16.5)**. The app streams the image parts directly from GitHub Releases into `/sdcard/Download/OneiOS/`, automatically concatenates them, extracts the files into `/data/local/tmp/oneios/image/`, and stages checksums.
+   Select **📥 Baixar direto do GitHub Releases (iOS 16.5)**. The app downloads the image parts from GitHub Releases into its own folder (an interrupted download resumes where it stopped), streams them straight into `/data/local/tmp/oneios/image/` without joining them on disk first, and stages the checksums.
    *(Alternatively, if you downloaded the package via browser or PC, choose **📂 Importar arquivo baixado**)*.
 4. **Launch iOS:**
    Once verified, the Dynamic Island status indicator will turn vibrant green:
    ```text
    🟢   SISTEMA PRONTO
    ```
-   Tap **▶ INICIAR SESSÃO IOS**. One UI will gracefully pause, and the iOS 16.5 Lock Screen will illuminate your screen.
+   Tap **▶ INICIAR SESSÃO IOS**. This starts the experimental iOS 16.5 session.
 5. **Returning to Android:**
    Hold **Volume Up + Volume Down for 3 seconds** to safely resume One UI right where you left off.
 

@@ -836,6 +836,12 @@ impl Emit<'_> {
         // corecrypto authenticates the relocated __text bytes in a fileset.
         let code = native.sections.iter().find(|s| s.segment == "__TEXT_EXEC" && s.name == "__text").ok_or_else(|| anyhow!("the kernel has no __TEXT_EXEC,__text"))?;
         let seals: Vec<_> = native.sections.iter().filter(|s| s.name == "__fips_hmacs").collect();
+        if seals.is_empty() {
+            // OneiOS: a kernel built with ONEIOS_CRYPTO=original links no source corecrypto, so it has no POST
+            // field to fill; the collection's own corecrypto kext authenticates itself (seal_components).
+            self.report.set("corecrypto_hmac_sha256", "none: no source corecrypto in the kernel");
+            return Ok(());
+        }
         if seals.len() != 1 || seals[0].size != 32 {
             bail!("Expected one 32-byte corecrypto HMAC field");
         }

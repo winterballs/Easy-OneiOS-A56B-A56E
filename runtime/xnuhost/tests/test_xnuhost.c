@@ -444,6 +444,13 @@ static void test_virtio_gpu(void)
       cmd[0] = 0x104; cmd[10] = id; cmd[11] = 0;                               // RESOURCE_FLUSH
       flush_rect[2] = 0;
       CHECK(SENDB(12) == 24 && resp[0] == 0x1100 && flush_rect[2] == 8);
+      CHECK(ready_count == before);                                           // black is never ready
+      uint8_t *source = xh_ram(backing, 4);
+      source[0] = 0x12;
+      cmd[0] = 0x105; cmd[10] = 0; cmd[11] = 0; cmd[12] = id;                 // TRANSFER_TO_HOST_2D
+      CHECK(SENDB(14) == 24 && resp[0] == 0x1100);
+      cmd[0] = 0x104; cmd[10] = id; cmd[11] = 0;
+      CHECK(SENDB(12) == 24 && resp[0] == 0x1100);
       CHECK(ready_count == before + (id == 2));
     }
 #undef SENDB

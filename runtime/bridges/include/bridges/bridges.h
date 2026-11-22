@@ -189,7 +189,9 @@ br_hci *br_hci_open_hidl(br_hci_rx_fn rx, br_hci_state_fn state, void *ctx);
 br_hci *br_hci_open_sim(br_hci_rx_fn rx, br_hci_state_fn state, void *ctx);
 void    br_hci_sim_set_address(const uint8_t address[6]);
 // Asks hwservicemanager for the HAL once and lets it go: 11 (1.1) or 10 (1.0) when it is registered and
-// this domain may find it, else -errno (-ENODEV: no binder device). Logs why when it is not found.
+// this domain may find it; else asks servicemanager (/dev/binder) for the AIDL
+// android.hardware.bluetooth.IBluetoothHci/default: 20 when found (br_hci_open_hidl then speaks AIDL);
+// else -errno (-ENODEV: no binder device). Logs why when it is not found.
 int     br_hci_hidl_probe(void);
 // The controller's address as the phone stores it (text "AA:BB:.." or 6 raw bytes). 0 or -1.
 int     br_bt_address(const char *path, uint8_t out[6]);

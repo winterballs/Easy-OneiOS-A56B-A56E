@@ -250,3 +250,107 @@ int bt_callback_transact(uint32_t code, hb_reader *r, hb_parcel *reply, uint8_t 
   }
   return HB_UNKNOWN_TRANSACTION;
 }
+
+// ---- AIDL ---------------------------------------------------------------------------------------
+void aidl_put_string16(hb_parcel *p, const char *text)
+{
+  size_t n = strlen(text);
+  hb_put_i32(p, (int32_t)n);
+  uint8_t *at = reserve(p, (n + 1) * 2);
+  if (at) for (size_t i = 0; i < n; i++) at[2 * i] = (uint8_t)text[i];   // the terminator and padding are zero
+}
+
+void aidl_put_token(hb_parcel *p, const char *interface, uint32_t header)
+{
+  hb_put_i32(p, 0);                // strict-mode policy
+  hb_put_i32(p, -1);               // work source: unset
+  hb_put_i32(p, (int32_t)header);
+  aidl_put_string16(p, interface);
+}
+
+void aidl_put_bytes(hb_parcel *p, const uint8_t *bytes, size_t length)
+{
+  hb_put_i32(p, (int32_t)length);
+  uint8_t *at = reserve(p, length);
+  if (at && length) memcpy(at, bytes, length);
+}
+
+void aidl_put_binder(hb_parcel *p, uint64_t pointer, uint64_t cookie)
+{
+  hb_put_binder(p, pointer, cookie);
+  hb_put_i32(p, AIDL_STABILITY_VINTF);   // the HAL is a VINTF service: it calls only binders at least that stable
+}
+
+bool aidl_get_token(hb_reader *r)
+{
+  hb_get_i32(r); hb_get_i32(r); hb_get_i32(r);
+  int32_t n = hb_get_i32(r);
+  if (r->bad || n < 0 || (size_t)n > (r->size - r->position) / 2) { r->bad = true; return false; }
+  r->position += (((size_t)n + 1) * 2 + 3) & ~(size_t)3;
+  if (r->position > r->size) { r->bad = true; return false; }
+  return true;
+}
+
+bool aidl_get_bytes(hb_reader *r, const uint8_t **bytes, size_t *length)
+{
+  int32_t n = hb_get_i32(r);
+  if (r->bad || n < 0 || (size_t)n > r->size - r->position) { r->bad = true; return false; }
+  *bytes = r->data + r->position;
+  *length = (size_t)n;
+  r->position += ((size_t)n + 3) & ~(size_t)3;
+  if (r->position > r->size) r->position = r->size;
+  return true;
+}
+
+void aidl_parcel_get_service(hb_parcel *p)
+{
+  hb_parcel_init(p);
+  aidl_put_token(p, AIDL_SM, AIDL_HDR_SYST);
+  aidl_put_string16(p, AIDL_HCI_NAME);
+}
+
+void aidl_parcel_initialize(hb_parcel *p, uint32_t header, uint64_t callback_pointer)
+{
+  hb_parcel_init(p);
+  aidl_put_token(p, AIDL_HCI, header);
+  aidl_put_binder(p, callback_pointer, callback_pointer);
+}
+
+void aidl_parcel_send(hb_parcel *p, uint32_t header, const uint8_t *packet, size_t length)
+{
+  hb_parcel_init(p);
+  aidl_put_token(p, AIDL_HCI, header);
+  aidl_put_bytes(p, packet, length);
+}
+
+int aidl_callback_transact(uint32_t code, hb_reader *r, hb_parcel *reply, uint8_t *type, const uint8_t **packet, size_t *length, int32_t *status)
+{
+  static const uint8_t h4[] = { [AIDL_CB_EVENT] = 4, [AIDL_CB_ACL] = 2, [AIDL_CB_SCO] = 3, [AIDL_CB_ISO] = 5 };
+  *type = 0; *packet = NULL; *length = 0; *status = -1;
+  hb_parcel_init(reply);
+  switch (code) {
+  case AIDL_INTERFACE:
+    aidl_put_string16(reply, AIDL_CALLBACKS);      // no status: the descriptor alone
+    return 0;
+  case AIDL_PING:
+    return 0;
+  }
+  if (!aidl_get_token(r)) return HB_UNKNOWN_TRANSACTION;
+  hb_put_i32(reply, 0);                              // Status::ok()
+  switch (code) {
+  case AIDL_CB_INIT_COMPLETE:
+    *status = hb_get_i32(r);
+    return r->bad ? HB_UNKNOWN_TRANSACTION : 0;
+  case AIDL_CB_EVENT: case AIDL_CB_ACL: case AIDL_CB_SCO: case AIDL_CB_ISO:
+    if (!aidl_get_bytes(r, packet, length)) return HB_UNKNOWN_TRANSACTION;
+    *type = h4[code];
+    return 0;
+  case AIDL_VERSION:
+    hb_put_i32(reply, 1);
+    return 0;
+  case AIDL_HASH:
+    aidl_put_string16(reply, "notfrozen");
+    return 0;
+  }
+  return HB_UNKNOWN_TRANSACTION;
+}

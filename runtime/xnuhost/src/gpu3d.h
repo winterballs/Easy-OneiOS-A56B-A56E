@@ -81,4 +81,6 @@ int xh_gpu3d_udmabuf(int ram_fd, uint64_t ram_phys, uint64_t ram_size, const xh_
 // The limits in use: bytes and runs per udmabuf. Setting them is for the tests (0, 0 reads the kernel's again).
 void xh_gpu3d_udmabuf_limits(uint64_t *bytes, unsigned *runs);
 void xh_gpu3d_udmabuf_set_limits(uint64_t bytes, unsigned runs);
+/* Checks DMA-BUF import, native AMDGPU submission and completion on the A56. */
+int xh_gpu3d_xclipse_selftest(void);
 #endif

@@ -1,0 +1,91 @@
+diff --git a/security/mac_vfs.c b/security/mac_vfs.c
+--- a/security/mac_vfs.c
++++ b/security/mac_vfs.c
+@@ -788,6 +788,65 @@
+ 	return error;
+ }
+ 
++#if XNU_HOSTED
++/*
++ * OneiOS hosted (0073): which MAC policy refuses an exec's credential update, and a way past one. iOS 16.5's
++ * mediaserverd (20F66) never ran on the A56: launchd's log has xpcproxy exiting with OS_REASON_EXEC code 8
++ * (EXEC_EXIT_REASON_SECURITY_POLICY) every 5 s, with nothing on the console, which is process_signature() seeing
++ * ip_mac_return, the error of this hook (kauth_proc_label_update_execve). SpringBoard then waits forever in
++ * MediaExperience for com.apple.coremedia.systemcontroller.xpc, which mediaserverd serves.
++ * One line per (executable, policy, error), at most 200:
++ *   oneios-mac-exec: mediaserverd: policy Sandbox refused the credential update (error 1)
++ * Boot argument oneios-mac-exec-skip=NAME[,NAME...]: for those executables (the file's name) a refusal by the Sandbox
++ * policy is ignored and the process runs without its sandbox profile. Off without it; other policies are never skipped.
++ */
++static char hosted_mac_exec_skip[256];
++static int hosted_mac_exec_state = -1;
++static uint32_t hosted_mac_exec_lines;
++static bool
++hosted_mac_exec_listed(const char *name)
++{
++	if (hosted_mac_exec_state < 0) {
++		hosted_mac_exec_state = PE_parse_boot_argn("oneios-mac-exec-skip", hosted_mac_exec_skip, sizeof(hosted_mac_exec_skip)) &&
++		    hosted_mac_exec_skip[0];
++	}
++	if (hosted_mac_exec_state == 0 || name == NULL) {
++		return false;
++	}
++	size_t length = strlen(name);
++	for (const char *at = hosted_mac_exec_skip; *at;) {
++		const char *end = strchr(at, ',');
++		size_t n = end ? (size_t)(end - at) : strlen(at);
++		if (n == length && !strncmp(at, name, n)) {
++			return true;
++		}
++		at += n + (end ? 1 : 0);
++	}
++	return false;
++}
++static int
++hosted_mac_exec_result(struct mac_policy_conf *mpc, struct vnode *vp, int error)
++{
++	if (error == 0 || mpc == NULL) {
++		return error;
++	}
++	const char *name = vp ? vnode_getname(vp) : NULL;
++	bool skip = mpc->mpc_name != NULL && !strcmp(mpc->mpc_name, "Sandbox") && hosted_mac_exec_listed(name);
++	if (hosted_mac_exec_lines < 200) {
++		hosted_mac_exec_lines++;
++		printf("oneios-mac-exec: %s: policy %s refused the credential update (error %d)%s\n", name ? name : "?",
++		    mpc->mpc_name ? mpc->mpc_name : "?", error, skip ? ": ignored (oneios-mac-exec-skip)" : "");
++	}
++	if (name != NULL) {
++		vnode_putname(name);
++	}
++	return skip ? 0 : error;
++}
++#define HOSTED_MAC_WRAP(m, v, e) hosted_mac_exec_result((m), (v), (e))
++#else
++#define HOSTED_MAC_WRAP(m, v, e) (e)
++#endif /* XNU_HOSTED */
++
+ void
+ mac_cred_label_update_execve(vfs_context_t ctx, kauth_cred_t new, struct vnode *vp, off_t offset,
+     struct vnode *scriptvp, struct label *scriptvnodelabel, struct label *execl, u_int *csflags,
+@@ -835,8 +894,8 @@
+ 			size_t spawnattrlen = 0;
+ 			void *spawnattr = exec_spawnattr_getmacpolicyinfo(macextensions, mpc->mpc_name, &spawnattrlen);
+ 
+-			error = mac_error_select(hook(cred, new, vfs_context_proc(ctx), vp, offset, scriptvp,
+-			    mac_vnode_label(vp), scriptvnodelabel, execl, csflags, spawnattr, spawnattrlen, disjoint),
++			error = mac_error_select(HOSTED_MAC_WRAP(mpc, vp, hook(cred, new, vfs_context_proc(ctx), vp, offset, scriptvp,
++			    mac_vnode_label(vp), scriptvnodelabel, execl, csflags, spawnattr, spawnattrlen, disjoint)),
+ 			    error);
+ 		}
+ 		if (mac_policy_list_conditional_busy() != 0) {
+@@ -854,8 +913,8 @@
+ 				size_t spawnattrlen = 0;
+ 				void *spawnattr = exec_spawnattr_getmacpolicyinfo(macextensions, mpc->mpc_name, &spawnattrlen);
+ 
+-				error = mac_error_select(hook(cred, new, vfs_context_proc(ctx), vp, offset, scriptvp,
+-				    mac_vnode_label(vp), scriptvnodelabel, execl, csflags, spawnattr, spawnattrlen, disjoint),
++				error = mac_error_select(HOSTED_MAC_WRAP(mpc, vp, hook(cred, new, vfs_context_proc(ctx), vp, offset, scriptvp,
++				    mac_vnode_label(vp), scriptvnodelabel, execl, csflags, spawnattr, spawnattrlen, disjoint)),
+ 				    error);
+ 			}
+ 			mac_policy_list_unbusy();

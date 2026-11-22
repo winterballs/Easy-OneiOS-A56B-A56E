@@ -13,6 +13,11 @@
 // No Android library is linked (xnuhost is static): the binder protocol is used through the kernel's
 // UAPI and the parcels are built by hidl_parcel.c. Needs root (KernelSU's domain): hwservicemanager
 // checks the caller's SELinux context for "find", and the HAL must be allowed to call back.
+//
+// AIDL: phones with the stable AIDL HAL instead (the Galaxy A56: android.hardware.bluetooth.IBluetoothHci/default,
+// process android.hardware.bluetooth-service.default) have no HIDL service; the probe then asks servicemanager on
+// /dev/binder and the same threads speak AIDL parcels (hidl_parcel.c's aidl_* part). ONEIOS_BINDER names another
+// device than /dev/binder. The token's partition header is 'SYST' (as wifi/aidl_parcel.c), 'VNDR' if the HAL refuses it.
 #define _GNU_SOURCE
 #include "bridges/bridges.h"
 #include "hidl_parcel.h"
@@ -52,6 +57,8 @@ typedef struct {
   unsigned head, count;
   uint32_t service;
   bool have_service, v1_1;
+  bool aidl;                      // the AIDL HAL on /dev/binder, not HIDL on /dev/hwbinder
+  uint32_t header;                // the AIDL token header the HAL accepted
   bool waiting_init;              // initialize() returned, initializationComplete not yet
   uint64_t dropped, events, logged_first;
 } hidl_bt;
@@ -63,8 +70,14 @@ static unsigned init_timeout_ms(void)
   return v > 0 && v < 600000 ? (unsigned)v : INIT_TIMEOUT_MS;
 }
 
-static const char *hwbinder_path(void)
+static int g_mode;               // 0: not probed, 1: HIDL, 2: AIDL
+
+static const char *binder_path(bool aidl)
 {
+  if (aidl) {
+    const char *a = getenv("ONEIOS_BINDER");
+    return a && *a ? a : "/dev/binder";
+  }
   const char *p = getenv("ONEIOS_HWBINDER");     // the PC test's binderfs; the phone's is /dev/hwbinder
   return p && *p ? p : "/dev/hwbinder";
 }
@@ -118,14 +131,15 @@ static void incoming(hidl_bt *b, const struct binder_transaction_data *tr)
   size_t length;
   int32_t status;
   hb_reader_init(&r, (const void *)(uintptr_t)tr->data.ptr.buffer, tr->data_size, (const void *)(uintptr_t)tr->data.ptr.offsets, tr->offsets_size);
-  int rc = bt_callback_transact(tr->code, &r, &reply, &type, &packet, &length, &status);
+  int rc = b->aidl ? aidl_callback_transact(tr->code, &r, &reply, &type, &packet, &length, &status)
+                   : bt_callback_transact(tr->code, &r, &reply, &type, &packet, &length, &status);
   if (!rc && type) {
     if (__atomic_fetch_add(&b->events, 1, __ATOMIC_RELAXED) == 0)
       br_log(1, "bluetooth: first packet from the controller (H4 type %u, %zu bytes)", type, length);
     br_hci_deliver(b->hci, type, packet, length);        // before the buffer is freed
   }
-  if (rc && tr->code < 0x0f000000u) br_log(0, "bluetooth: the HAL called back with code %u and a parcel not understood: answered %d", tr->code, rc);
-  if (!rc && tr->code == BT_CB_INIT_COMPLETE) {
+  if (rc && tr->code < 0x00fffff0u) br_log(0, "bluetooth: the HAL called back with code %u and a parcel not understood: answered %d", tr->code, rc);
+  if (!rc && tr->code == (b->aidl ? (uint32_t)AIDL_CB_INIT_COMPLETE : (uint32_t)BT_CB_INIT_COMPLETE)) {
     pthread_mutex_lock(&b->lock);
     bool expected = b->waiting_init;
     b->waiting_init = false;
@@ -279,6 +293,10 @@ static void drop_service(hidl_bt *b)
 static int find_service(hidl_bt *b)
 {
   static _Thread_local hb_parcel p;
+  if (b->aidl) {
+    aidl_parcel_get_service(&p);
+    return call(b, 0, 1 /* IServiceManager::getService */, &p, take_service);
+  }
   // The 1.1 name first: a 1.1 service is registered under both, a 1.0 one only under the second.
   b->v1_1 = true;
   bt_parcel_get_service(&p, BT_HCI_1_1, "default");
@@ -296,26 +314,39 @@ static void connect_hal(hidl_bt *b)
   static _Thread_local hb_parcel p;
   int rc = find_service(b);
   if (rc) {
-    br_log(0, "bluetooth: off: no android.hardware.bluetooth@1.x::IBluetoothHci/default from hwservicemanager: %s%s", why(rc),
-           rc == -ENOENT ? " (not registered, or SELinux denies find to this domain)" : "");
+    br_log(0, "bluetooth: off: no %s: %s%s",
+           b->aidl ? AIDL_HCI_NAME " from servicemanager" : "android.hardware.bluetooth@1.x::IBluetoothHci/default from hwservicemanager",
+           why(rc), rc == -ENOENT ? " (not registered, or SELinux denies find to this domain)" : "");
     br_hci_set_state(b->hci, 2);
     return;
   }
   pthread_mutex_lock(&b->lock);
   b->waiting_init = true;
   pthread_mutex_unlock(&b->lock);
-  bt_parcel_initialize(&p, b->v1_1, (uint64_t)(uintptr_t)b);
-  rc = call(b, b->service, b->v1_1 ? BT_INITIALIZE_1_1 : BT_INITIALIZE, &p, NULL);
+  if (b->aidl) {
+    static const uint32_t headers[] = { AIDL_HDR_SYST, AIDL_HDR_VNDR };
+    for (unsigned i = 0; i < 2; i++) {
+      b->header = headers[i];
+      aidl_parcel_initialize(&p, b->header, (uint64_t)(uintptr_t)b);
+      rc = call(b, b->service, AIDL_INITIALIZE, &p, NULL);
+      if (!rc || rc == -ETIMEDOUT || rc == -EPIPE) break;
+      br_log(1, "bluetooth: AIDL initialize with header %s: %d%s", i ? "VNDR" : "SYST", rc, i ? "" : "; trying VNDR");
+    }
+  } else {
+    bt_parcel_initialize(&p, b->v1_1, (uint64_t)(uintptr_t)b);
+    rc = call(b, b->service, b->v1_1 ? BT_INITIALIZE_1_1 : BT_INITIALIZE, &p, NULL);
+  }
   if (rc) {
     pthread_mutex_lock(&b->lock);
     b->waiting_init = false;
     pthread_mutex_unlock(&b->lock);
-    br_log(0, "bluetooth: off: IBluetoothHci::initialize%s: %s", b->v1_1 ? "_1_1" : "", why(rc));
+    br_log(0, "bluetooth: off: IBluetoothHci::initialize%s: %s", b->aidl ? " (AIDL)" : b->v1_1 ? "_1_1" : "", why(rc));
     drop_service(b);
     br_hci_set_state(b->hci, 2);
     return;
   }
-  br_log(1, "bluetooth: HAL %s found, initialising (power and firmware are the HAL's)", b->v1_1 ? "1.1" : "1.0");
+  br_log(1, "bluetooth: HAL %s found, initialising (power and firmware are the HAL's)",
+         b->aidl ? (b->header == AIDL_HDR_VNDR ? "AIDL (VNDR)" : "AIDL (SYST)") : b->v1_1 ? "1.1" : "1.0");
 }
 
 static void disconnect_hal(hidl_bt *b)
@@ -328,8 +359,9 @@ static void disconnect_hal(hidl_bt *b)
   pthread_mutex_unlock(&b->lock);
   if (!have) return;
   hb_parcel_init(&p);
-  hb_put_token(&p, BT_HCI_1_0);
-  int rc = call(b, handle, BT_CLOSE, &p, NULL);
+  if (b->aidl) aidl_put_token(&p, AIDL_HCI, b->header);
+  else hb_put_token(&p, BT_HCI_1_0);
+  int rc = call(b, handle, b->aidl ? AIDL_CLOSE : BT_CLOSE, &p, NULL);
   drop_service(b);
   br_log(rc ? 0 : 1, "bluetooth: HAL closed%s%s (%llu packets from the controller, %llu dropped: queue full)", rc ? ": " : "", rc ? why(rc) : "",
          (unsigned long long)__atomic_load_n(&b->events, __ATOMIC_RELAXED), (unsigned long long)b->dropped);
@@ -339,13 +371,20 @@ static void send_packet(hidl_bt *b, const work *w)
 {
   static _Thread_local hb_parcel p;
   static const uint8_t code[] = { [1] = BT_SEND_COMMAND, [2] = BT_SEND_ACL, [3] = BT_SEND_SCO, [5] = BT_SEND_ISO };
+  static const uint8_t acode[] = { [1] = AIDL_SEND_COMMAND, [2] = AIDL_SEND_ACL, [3] = AIDL_SEND_SCO, [5] = AIDL_SEND_ISO };
   pthread_mutex_lock(&b->lock);
   bool have = b->have_service;
   uint32_t handle = b->service;
   pthread_mutex_unlock(&b->lock);
-  if (!have || w->type > 5 || !code[w->type] || (w->type == 5 && !b->v1_1)) return;
-  bt_parcel_send(&p, code[w->type], w->data, w->length);
-  int rc = call(b, handle, code[w->type], &p, NULL);
+  if (!have || w->type > 5 || !code[w->type] || (w->type == 5 && !b->v1_1 && !b->aidl)) return;
+  int rc;
+  if (b->aidl) {
+    aidl_parcel_send(&p, b->header, w->data, w->length);
+    rc = call(b, handle, acode[w->type], &p, NULL);
+  } else {
+    bt_parcel_send(&p, code[w->type], w->data, w->length);
+    rc = call(b, handle, code[w->type], &p, NULL);
+  }
   if (rc) br_log(0, "bluetooth: sending an H4 type %u packet to the HAL: %s", w->type, why(rc));
 }
 
@@ -441,12 +480,12 @@ static int binder_open(hidl_bt *b)
 {
   struct binder_version version = { 0 };
   uint32_t threads = 0;
-  b->fd = open(hwbinder_path(), O_RDWR | O_CLOEXEC | O_NONBLOCK);
-  if (b->fd < 0) { br_log(0, "bluetooth: off: %s: %s", hwbinder_path(), strerror(errno)); return -1; }
+  b->fd = open(binder_path(b->aidl), O_RDWR | O_CLOEXEC | O_NONBLOCK);
+  if (b->fd < 0) { br_log(0, "bluetooth: off: %s: %s", binder_path(b->aidl), strerror(errno)); return -1; }
   if (ioctl(b->fd, BINDER_VERSION, &version) < 0 || version.protocol_version != BINDER_CURRENT_PROTOCOL_VERSION ||
       (b->map = mmap(NULL, MAP_SIZE, PROT_READ, MAP_PRIVATE | MAP_NORESERVE, b->fd, 0)) == MAP_FAILED ||
       ioctl(b->fd, BINDER_SET_MAX_THREADS, &threads) < 0) {
-    br_log(0, "bluetooth: off: hwbinder setup (protocol %d): %s", version.protocol_version, strerror(errno));
+    br_log(0, "bluetooth: off: %s setup (protocol %d): %s", binder_path(b->aidl), version.protocol_version, strerror(errno));
     close(b->fd);
     return -1;
   }
@@ -457,6 +496,8 @@ br_hci *br_hci_open_hidl(br_hci_rx_fn rx, br_hci_state_fn state, void *ctx)
 {
   hidl_bt *b = calloc(1, sizeof *b);
   if (!b) return NULL;
+  if (!g_mode) (void)br_hci_hidl_probe();
+  b->aidl = g_mode == 2;
   if (binder_open(b) || pipe2(b->wake, O_CLOEXEC)) { free(b); return NULL; }
   pthread_mutex_init(&b->lock, NULL);
   pthread_condattr_t attr;
@@ -471,20 +512,32 @@ br_hci *br_hci_open_hidl(br_hci_rx_fn rx, br_hci_state_fn state, void *ctx)
   return b->hci;
 }
 
-int br_hci_hidl_probe(void)
+static int probe_one(bool aidl)
 {
   hidl_bt b = { 0 };
+  b.aidl = aidl;
   if (binder_open(&b)) return -ENODEV;
   pthread_mutex_init(&b.lock, NULL);
   int rc = find_service(&b);
-  if (!rc) rc = b.v1_1 ? 11 : 10;
-  else br_log(0, "bluetooth: no android.hardware.bluetooth@1.x::IBluetoothHci/default from hwservicemanager: %s%s", why(rc),
-              rc == -ENOENT ? " (not registered, or SELinux denies find to this domain)" : "");
+  if (!rc) rc = aidl ? 20 : b.v1_1 ? 11 : 10;
+  else br_log(aidl ? 0 : 1, "bluetooth: no %s: %s%s",
+              aidl ? AIDL_HCI_NAME " from servicemanager" : "android.hardware.bluetooth@1.x::IBluetoothHci/default from hwservicemanager",
+              why(rc), rc == -ENOENT ? " (not registered, or SELinux denies find to this domain)" : "");
   drop_service(&b);
   munmap(b.map, MAP_SIZE);
   close(b.fd);                    // the driver drops what is left
   pthread_mutex_destroy(&b.lock);
   return rc;
+}
+
+// HIDL first (the S24 Ultra), then AIDL (the A56). 11/10: HIDL 1.1/1.0, 20: AIDL, else -errno.
+int br_hci_hidl_probe(void)
+{
+  int rc = probe_one(false);
+  if (rc > 0) { g_mode = 1; return rc; }
+  int arc = probe_one(true);
+  if (arc > 0) { g_mode = 2; br_log(1, "bluetooth: the HAL is the AIDL one (%s)", AIDL_HCI_NAME); return arc; }
+  return rc == -ENODEV ? arc : rc;
 }
 #else
 br_hci *br_hci_open_hidl(br_hci_rx_fn rx, br_hci_state_fn state, void *ctx) { (void)rx; (void)state; (void)ctx; return NULL; }

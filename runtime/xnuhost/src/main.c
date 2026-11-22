@@ -832,6 +832,7 @@ int main(int argc, char **argv)
   // APIA key. The kernel's vCPUs and the tasks need one key set (pac_shared_by_threads).
   android_set_application_target_sdk_version(30);
 #endif
+  if (argc == 2 && !strcmp(argv[1], "--selftest-xclipse")) return xh_gpu3d_xclipse_selftest();
   xh_config_defaults(&config);
   if (xh_config_args(&config, argc, argv) || xh_config_finish(&config)) return EXIT_SETUP;
   xh_log_open(NULL, config.log_level);

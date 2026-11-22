@@ -1,0 +1,59 @@
+diff --git a/iokit/Kernel/IOSharedDataQueue.cpp b/iokit/Kernel/IOSharedDataQueue.cpp
+--- a/iokit/Kernel/IOSharedDataQueue.cpp
++++ b/iokit/Kernel/IOSharedDataQueue.cpp
+@@ -215,6 +215,45 @@
+ 	return entry;
+ }
+ 
++#if XNU_HOSTED
++#include <pexpert/pexpert.h>
++/*
++ * OneiOS hosted (0074), a debugging aid: the bytes of the first entries queued on shared data queues (IOHIDFamily's
++ * event queues to backboardd among them), to compare iOS 27's serialized IOHIDEvents with what iOS 16.5's IOKit reads.
++ * Boot argument oneios-dq-dump=N: the first N entries of 0x20..0x800 bytes, each as lines of 32 bytes in hex:
++ *   oneios-dq: entry 3 size 0x88 @0x00: 88000000 0b000000 ...
++ * Off without it.
++ */
++static int hosted_dq_left = -1;
++static void
++hosted_dq_dump(const void *data, UInt32 size)
++{
++	if (hosted_dq_left < 0) {
++		int n = 0;
++		hosted_dq_left = PE_parse_boot_argn("oneios-dq-dump", &n, sizeof(n)) && n > 0 ? (n > 400 ? 400 : n) : 0;
++	}
++	if (hosted_dq_left <= 0 || data == NULL || size < 0x20 || size > 0x800) {
++		return;
++	}
++	int index = --hosted_dq_left;
++	const uint8_t *p = (const uint8_t *)data;
++	for (UInt32 off = 0; off < size && off < 0x200; off += 32) {
++		char line[32 * 2 + 16];
++		unsigned at = 0;
++		for (UInt32 i = off; i < size && i < off + 32; i++) {
++			static const char hx[] = "0123456789abcdef";
++			line[at++] = hx[p[i] >> 4];
++			line[at++] = hx[p[i] & 15];
++			if ((i & 3) == 3) {
++				line[at++] = ' ';
++			}
++		}
++		line[at] = 0;
++		printf("oneios-dq: entry %d size 0x%x @0x%02x: %s\n", index, (unsigned)size, (unsigned)off, line);
++	}
++}
++#endif /* XNU_HOSTED */
++
+ Boolean
+ IOSharedDataQueue::enqueue(void * data, UInt32 dataSize)
+ {
+@@ -223,6 +262,9 @@
+ 	UInt32             newTail;
+ 	const UInt32       entrySize = dataSize + DATA_QUEUE_ENTRY_HEADER_SIZE;
+ 	IODataQueueEntry * entry;
++#if XNU_HOSTED
++	hosted_dq_dump(data, dataSize);
++#endif
+ 
+ 	// Force a single read of head and tail
+ 	// See rdar://problem/40780584 for an explanation of relaxed/acquire barriers

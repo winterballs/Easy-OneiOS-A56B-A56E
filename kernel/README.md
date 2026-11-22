@@ -167,6 +167,13 @@ of 85 distinct registers, 127 `wfe`, 101 `tlbi`, 85 `dc`, 4 `ic`, 4 `at`, 4 `wfi
   links its source corecrypto (`corecrypto-2023`, Apple's Internal Use License, no redistribution), and the ArmCpu
   and pthread recipes require it. The record says `"releasable": false`. Owners build the kernel themselves
   (91 s on Linux); a release is runtime-only until a configuration without that source links and boots.
+- `ONEIOS_CRYPTO=original` (`kernel/build-hosted.sh`, docs/building.md section 2) links no source corecrypto: the
+  kernel uses the kernelcache's own corecrypto kext once prelinked. Booted to the iOS 16.5 lock screen on the A56
+  (2026-11-18). Such an `xnu.macho` removes the corecrypto reason above; whether it may be released is **not yet
+  checked**: the record still says `"releasable": false`, and the other linked parts (ArmCpu, libpthread,
+  libfirehose, the board's archives, the KDK headers the build reads) need a licence review first. A prelinked
+  `kernel.kc` is never releasable either way (Apple's kexts): the plan is for each phone to prelink its own from the
+  kernelcache it downloads from Apple.
 - Never in git or a release: the kernelcache, a prelinked `kernel.kc`, KDK headers (`out/`).
 - UniXNU, UniXNU-droidvm: BSD-2-Clause-Patent. xnu-linux-toolchain: see its repository. libdispatch (firehose):
   Apache 2.0. libpthread, libplatform: APSL 2.0.

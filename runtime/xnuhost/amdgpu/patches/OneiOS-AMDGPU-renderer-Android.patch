@@ -1,0 +1,216 @@
+diff --git a/src/drm/amdgpu/amdgpu_renderer.c b/src/drm/amdgpu/amdgpu_renderer.c
+index cf7f4f1..fe4f025 100644
+--- a/src/drm/amdgpu/amdgpu_renderer.c
++++ b/src/drm/amdgpu/amdgpu_renderer.c
+@@ -30,7 +30,6 @@
+ #include "util/os_file.h"
+ #include "util/u_atomic.h"
+ #include "util/u_math.h"
+-#include "vrend/vrend_renderer.h"
+ #include "amdgpu_virtio_proto.h"
+ #include "virgl_context.h"
+ #include "virglrenderer.h"
+@@ -41,11 +40,14 @@
+ #include <string.h>
+ #include <unistd.h>
+ #include <sys/mman.h>
++#include <sys/ioctl.h>
++#include <linux/dma-buf.h>
+ 
+ #include <xf86drm.h>
+ 
+ #include <amdgpu.h>
+ #include "drm_context.h"
++#include "gpu_pool.h"
+ #include "drm_util.h"
+ #include "drm_fence.h"
+ 
+@@ -80,6 +82,8 @@ struct amdgpu_context {
+    const char *debug_name;
+ 
+    struct amdvgpu_shmem *shmem;
++   xh_gpu_pool *response_pool;
++   xh_gpu_pool_mapping response;
+ 
+    struct amdgpu_ccmd_rsp *current_rsp;
+ 
+@@ -93,6 +97,11 @@ struct amdgpu_context {
+ };
+ DEFINE_CAST(drm_context, amdgpu_context)
+ 
++static void set_dmabuf_name(int fd, const char *name)
++{
++   (void)ioctl(fd, DMA_BUF_SET_NAME, name);
++}
++
+ static
+ int close_fd(struct amdgpu_context *ctx, int fd, const char *from) {
+    print(2, "close_fd %d (%s)", fd, from);
+@@ -115,9 +124,10 @@ amdgpu_renderer_probe(int fd, struct virgl_renderer_capset_drm *capset)
+                                       &capset->u.amdgpu.alignments);
+    amdgpu_query_gpu_info(dev,
+                          &capset->u.amdgpu.gpu_info);
+-   strncpy(capset->u.amdgpu.marketing_name,
+-           amdgpu_get_marketing_name(dev),
+-           sizeof(capset->u.amdgpu.marketing_name) - 1);
++   const char *name = amdgpu_get_marketing_name(dev);
++   if (name)
++      strncpy(capset->u.amdgpu.marketing_name, name,
++              sizeof(capset->u.amdgpu.marketing_name) - 1);
+    capset->u.amdgpu.has_vm_always_valid = 1;
+ 
+    amdgpu_device_deinitialize(dev);
+@@ -156,9 +166,14 @@ amdgpu_renderer_destroy(struct virgl_context *vctx)
+    }
+ 
+    drm_context_deinit(&ctx->base);
++   if (ctx->response.address)
++      xh_gpu_pool_unmap(ctx->response_pool, &ctx->response);
+ 
+-   if (ctx->id_to_ctx)
+-      _mesa_hash_table_u64_destroy(ctx->id_to_ctx, free_id_to_ctx);
++   if (ctx->id_to_ctx) {
++      hash_table_foreach(ctx->id_to_ctx->table, entry)
++         free_id_to_ctx(entry);
++      _mesa_hash_table_u64_destroy(ctx->id_to_ctx);
++   }
+ 
+    amdgpu_device_deinitialize(ctx->dev);
+ 
+@@ -368,6 +383,52 @@ update_heap_info_in_shmem(struct amdgpu_context *ctx)
+                           &ctx->shmem->gtt);
+ }
+ 
++int
++amdgpu_renderer_set_response_pool(struct virgl_context *vctx, xh_gpu_pool *pool)
++{
++   struct amdgpu_context *ctx = to_amdgpu_context(to_drm_context(vctx));
++   if (!pool || ctx->base.shmem)
++      return -EINVAL;
++   ctx->response_pool = pool;
++   return 0;
++}
++
++static int
++amdgpu_response_blob(struct amdgpu_context *ctx, uint64_t size,
++                     uint32_t flags, struct virgl_context_blob *blob)
++{
++   struct drm_context *dctx = &ctx->base;
++   xh_gpu_pool *pool = ctx->response_pool;
++   if (flags != VIRGL_RENDERER_BLOB_FLAG_USE_MAPPABLE || dctx->shmem ||
++       dctx->blob_size || size < sizeof(*ctx->shmem) || size > UINT32_MAX)
++      return -EINVAL;
++
++   int fd = os_dupfd_cloexec(pool->fd);
++   if (fd < 0)
++      return -errno;
++
++   int ret = xh_gpu_pool_map(pool, size, &ctx->response);
++   if (ret) {
++      close(fd);
++      return ret;
++   }
++
++   uint8_t *address = ctx->response.address;
++   dctx->shmem = (struct vdrm_shmem *)address;
++   dctx->shmem->rsp_mem_offset = sizeof(*ctx->shmem);
++   dctx->rsp_mem = address + sizeof(*ctx->shmem);
++   dctx->rsp_mem_sz = size - sizeof(*ctx->shmem);
++   dctx->blob_size = size;
++   dctx->borrowed_shmem = true;
++
++   blob->type = VIRGL_RESOURCE_FD_SHM;
++   blob->u.fd = fd;
++   blob->map_ptr = address;
++   blob->fd_offset = pool->offset + ctx->response.offset;
++   blob->map_info = VIRGL_RENDERER_MAP_CACHE_CACHED;
++   return 0;
++}
++
+ static int
+ amdgpu_renderer_get_blob(struct virgl_context *vctx, uint32_t res_id, uint64_t blob_id,
+                          uint64_t blob_size, uint32_t blob_flags,
+@@ -390,8 +451,10 @@ amdgpu_renderer_get_blob(struct virgl_context *vctx, uint32_t res_id, uint64_t b
+       char name[64];
+       snprintf(name, 64, "amdgpu-shmem-%s", ctx->debug_name);
+ 
+-      int ret = drm_context_get_shmem_blob(dctx, name, sizeof(*ctx->shmem),
+-                                           blob_size, blob_flags, blob);
++      int ret = ctx->response_pool
++         ? amdgpu_response_blob(ctx, blob_size, blob_flags, blob)
++         : drm_context_get_shmem_blob(dctx, name, sizeof(*ctx->shmem),
++                                      blob_size, blob_flags, blob);
+       if (ret)
+          return ret;
+ 
+@@ -986,7 +1049,7 @@ amdgpu_ccmd_cs_submit(struct drm_context *dctx, struct vdrm_ccmd_req *hdr)
+       num_chunks++;
+    }
+ 
+-   int in_fence_fd = virgl_context_take_in_fence_fd(&ctx->base.base);
++   int in_fence_fd = -1;
+    if (in_fence_fd >= 0) {
+       chunks[num_chunks].chunk_id = AMDGPU_CHUNK_ID_SYNCOBJ_IN;
+       chunks[num_chunks].length_dw = sizeof(syncobj_in) / 4;
+@@ -1254,10 +1317,8 @@ amdgpu_renderer_create(int fd, size_t debug_len, const char *debug_name)
+    ctx->base.base.destroy = amdgpu_renderer_destroy;
+    ctx->base.base.attach_resource = amdgpu_renderer_attach_resource;
+    ctx->base.base.export_opaque_handle = amdgpu_renderer_export_opaque_handle;
+-   ctx->base.base.resource_map = amdgpu_renderer_resource_map;
+    ctx->base.base.get_blob = amdgpu_renderer_get_blob;
+    ctx->base.base.submit_fence = amdgpu_renderer_submit_fence;
+-   ctx->base.base.supports_fence_sharing = true;
+    ctx->base.free_object = amdgpu_renderer_free_object;
+ 
+    ctx->id_to_ctx = _mesa_hash_table_u64_create(NULL);
+@@ -1295,7 +1356,7 @@ amdgpu_renderer_create(int fd, size_t debug_len, const char *debug_name)
+    return &ctx->base.base;
+ 
+ fail_context_deinit:
+-   _mesa_hash_table_u64_destroy(ctx->id_to_ctx, NULL);
++   _mesa_hash_table_u64_destroy(ctx->id_to_ctx);
+ fail_hash_table:
+    drm_context_deinit(&ctx->base);
+ fail_init:
+diff --git a/src/drm/amdgpu/amdgpu_renderer.h b/src/drm/amdgpu/amdgpu_renderer.h
+index 40ebb1f..65fa0f7 100644
+--- a/src/drm/amdgpu/amdgpu_renderer.h
++++ b/src/drm/amdgpu/amdgpu_renderer.h
+@@ -18,6 +18,10 @@
+ #include "amdgpu_drm.h"
+ #include "drm_hw.h"
+ 
++struct virgl_context;
++struct xh_gpu_pool;
++int amdgpu_renderer_set_response_pool(struct virgl_context *vctx, struct xh_gpu_pool *pool);
++
+ int amdgpu_renderer_probe(int fd, struct virgl_renderer_capset_drm *capset);
+ 
+ struct virgl_context *amdgpu_renderer_create(int fd, size_t debug_len, const char *debug_name);
+diff --git a/src/drm/drm_context.c b/src/drm/drm_context.c
+index 028114b..d43d4b0 100644
+--- a/src/drm/drm_context.c
++++ b/src/drm/drm_context.c
+@@ -52,7 +52,9 @@ drm_context_unmap_shmem_blob(struct drm_context *dctx)
+    if (!dctx->shmem)
+       return;
+ 
+-   munmap(dctx->shmem, dctx->blob_size);
++   if (!dctx->borrowed_shmem)
++      munmap(dctx->shmem, dctx->blob_size);
++   dctx->borrowed_shmem = false;
+ 
+    dctx->shmem = NULL;
+    dctx->rsp_mem = NULL;
+diff --git a/src/drm/drm_context.h b/src/drm/drm_context.h
+index 5c75553..5dd5485 100644
+--- a/src/drm/drm_context.h
++++ b/src/drm/drm_context.h
+@@ -44,6 +44,7 @@ struct drm_context {
+    uint8_t *rsp_mem;
+    uint32_t rsp_mem_sz;
+    uint32_t blob_size;
++   bool borrowed_shmem;
+ 
+    struct vdrm_ccmd_rsp *current_rsp;
+ 

@@ -449,7 +449,7 @@ thread; none was seen.) Boot arguments:
 
 | Argument | |
 |---|---|
-| `oneios-gpu-metal=0` / `=1` | never / always publish. Not given: published when the host's virtio GPU offers 3D (`oneios_gpu3d_state` 3), so not on the PC. Droid-VM's `droidvm-gpu-metal` is read when this one is absent |
+| `oneios-gpu-metal=0` / `=1` | never / always publish. Not given: published when the host's virtio GPU offers 3D (`oneios_gpu3d_state` 3), so not on the PC. Droid-VM's `droidvm-gpu-metal` is read when this one is absent. The Galaxy A56's iOS 16.5 (20F66) sessions pass `=0` (the A56 switch script, and roottweak for new 20F66 images): that build's stock Metal opens the accelerator as an IOGPU device client (type 1), which NativeAdreno refuses (`0xe00002c7`), and backboardd had a Metal device that could not draw. Without the accelerator the panel is still black for another reason: iOS 27's IOMobileGraphicsFamily refuses 20F66's swap record (`docs/a56-guide.md`) |
 | `droidvm-gpu-clients=a,b,...` or `*` | the processes besides `backboardd` that get a Metal device: the grant of the user client (DroidVMGpu.cpp `grantedProcesses`) and, since `0039`, the plug-in's `NativeAdrenoMetal.clients`, which the kernel writes beside the bundle at every boot from the same list (`oneios_gpu_client_list` in `gpu/OneiOSAdreno.cpp`). Forms: a name, `X*`, `*X*`, `@apps`, `*`. Not given: `*`, every process (since 2026-11-12, the owner's decision; before: `WidgetRenderer_Default,*Poster*,iconservicesagent,SBRendererService`, and SpringBoard, the apps, the keyboard and WebKit drew on the CPU). The default is in the kernel, not in xnuhost's boot arguments: the image's `overlay/userland/xnuhost.conf` carries its own `boot-args`, which replace xnuhost's default, so only a kernel default reaches every image without a new image or seed; empty: `backboardd` alone |
 | `oneios-gpu-plugin-clients=...` | a test: the plug-in's list alone (the processes it names ask for a device; the grant decides for the names it holds, the sandbox for the rest). Not given: the list above |
 | `vgpu-3d=1` | what `GETPARAM(DEFAULT_3D)` answers the plug-in (DroidVMVirtioGpu3D.cpp reads it with default 0; `vgpu-3d=0` also turns the driver off) |
@@ -914,3 +914,15 @@ re-signed by both: the same bytes).
 showed it to iOS (section 5.1), and that patch has compiled but not run. Whether dyld and AMFI of this guest accept the binaries, whether the
 writes above have the effect they have on the iPad, and whether MetalCheck passes are all open.
 
+
+## 8. The Galaxy A56: Xclipse (AMDGPU)
+
+The A56's GPU is a Samsung Xclipse (AMD RDNA, Linux `amdgpu`), so drm2kgsl and Turnip (sections 2 and 7) do not
+fit it. The host side of an AMDGPU path (a virglrenderer `amdgpu` native context, `xnuhost --selftest-xclipse`, a
+response pool) and a guest probe were written on 2026-11-13/14 outside this repository and brought in on
+2026-11-21: `runtime/xnuhost/amdgpu/README.md` (files, build, results), `runtime/xnuhost/src/gpu3d_xclipse.c`,
+`gpu_pool.c`, `userland/metal/amdgpu/`. Linked only with `AMDGPU_RENDERER_LIBS`.
+
+Results then: native submits and fences on the host PASS; a GFX NOP from the guest kernel through virtio PASS;
+iOS 16.5's UI with `vgpu-3d=1` black. Missing: a Darwin Vulkan driver for this protocol and Metal on it. The A56's
+sessions run `--gpu 2d` (60 Hz since 2026-11-21).
